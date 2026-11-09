@@ -1,30 +1,43 @@
 #!/usr/bin/env bash
-# Rakazo – writes the .env for docker-compose.yml.
+# Rakazo – sets up and checks the Docker Compose deployment in /opt/rakazo.
 #
-#   ./generate-env.sh           Create or update .env interactively. Existing secrets and custom
-#                               entries are kept, the previous file is backed up.
+#   ./generate-env.sh           Create or update the deployment interactively: .env, the Compose
+#                               files, the optional Postfix mail server, /etc/caddy/Caddyfile and
+#                               the DNS records to set. Secrets and custom entries are kept,
+#                               replaced files are backed up.
 #   ./generate-env.sh --owner   Create the admin account with a password (stack must be running)
-#   ./generate-env.sh --check   Check .env; with the stack running also health, host check,
-#                               accounts, computers, screen proxy, Caddy, TLS and CORS
+#   ./generate-env.sh --check   Check the deployment, Caddy, mail and DNS; with the stack running
+#                               also health, host check, accounts, computers, screen proxy and CORS
 #   ./generate-env.sh --deactivate EMAIL
 #                               Lock an account: ends its sign-ins, computers and runs (edge)
 #   ./generate-env.sh --reactivate EMAIL
 #                               Unlock it again (edge)
+#   --dir DIR                   Deployment directory for all of the above (default /opt/rakazo)
 #
-# .env holds secrets, domain, ports and options. Everything else is fixed in docker-compose.yml
-# and takes precedence there.
+# Run it from the git checkout. It copies docker-compose.yml (with the mail server also the hooks
+# in postfix/) to the deployment directory and writes .env there. .env holds secrets, domain,
+# ports and options; everything else is fixed in docker-compose.yml and takes precedence there.
+# RAKAZO_CADDYFILE=FILE manages another file than /etc/caddy/Caddyfile.
 
 set -euo pipefail
 ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))) ||
   { echo "Error: Bash 4.4 or newer required." >&2; exit 1; }
-cd "$(dirname "${BASH_SOURCE[0]}")"
+shopt -u patsub_replacement 2>/dev/null || true
 
+REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+DEPLOY_DIR=/opt/rakazo
+DIR_OPT=""         # " --dir DIR" for printed commands when DEPLOY_DIR is not the default
+CADDY_FILE=${RAKAZO_CADDYFILE:-/etc/caddy/Caddyfile}
 ENV_FILE=.env
 DEFAULT_WEB_PORT=5173
 DEFAULT_API_PORT=3100
 CADDY_EXAMPLE_URL=https://github.com/nicolaeser/Rakazo-Setup/blob/main/Caddyfile.example
-CADDY_EXAMPLE_RAW=https://raw.githubusercontent.com/nicolaeser/Rakazo-Setup/main/Caddyfile.example
 INBOUND_EMAIL_DOCS=https://github.com/elie222/rakazo/blob/main/docs/self-host-inbound-email.md
+# Caddy's certificates as the package stores them; Postfix mounts this folder at /tls.
+CADDY_CERTS=/var/lib/caddy/.local/share/caddy/certificates
+LE_STORE=acme-v02.api.letsencrypt.org-directory
+STAMP=$(date +%Y%m%d-%H%M%S)
+OWNER_USER=${SUDO_USER:-$(id -un)}
 
 # Managed by this script.
 MANAGED_KEYS=(
@@ -40,6 +53,7 @@ MANAGED_KEYS=(
   DEEPSEEK_API_KEY RAKAZO_LOCAL_MODELS_URL RAKAZO_LOCAL_MODELS RAKAZO_LOCAL_VISION_MODELS
   RAKAZO_LOCAL_CONTEXT_WINDOW RAKAZO_LOCAL_MAX_TOKENS RAKAZO_LOCAL_MODELS_API_KEY RAKAZO_IMAGE_TAG
   SCIM_BEARER_TOKEN INBOUND_EMAIL_DOMAIN INBOUND_EMAIL_SECRET
+  COMPOSE_PROFILES
 )
 # Read only by edge until the release after v0.8.0.
 EDGE_KEYS=(SCIM_BEARER_TOKEN INBOUND_EMAIL_DOMAIN INBOUND_EMAIL_SECRET RAKAZO_LOCAL_MODELS_API_KEY)
@@ -47,7 +61,7 @@ EDGE_KEYS=(SCIM_BEARER_TOKEN INBOUND_EMAIL_DOMAIN INBOUND_EMAIL_SECRET RAKAZO_LO
 FIXED_KEYS=(
   NODE_ENV DATA_DIR WAKEUP_DRIVER AGENT_RUNTIME SANDBOX_PROVIDER SANDBOX_SUPERVISOR_URL
   CONTENT_ENCRYPTION MAX_UPLOAD_SIZE_MB API_HOST API_PORT POSTGRES_USER POSTGRES_DB
-  POSTGRES_APP_PASSWORD COMPOSE_PROFILES RAKAZO_DATA_DIR RAKAZO_CREDENTIALS_DIR
+  POSTGRES_APP_PASSWORD RAKAZO_DATA_DIR RAKAZO_CREDENTIALS_DIR
   RAKAZO_IMAGE RAKAZO_COMPUTER_IMAGE RAKAZO_COMPUTER_IMAGE_TAG
   POSTGRES_IMAGE BUSYBOX_IMAGE CADDY_IMAGE CADDYFILE_PATH CADDY_HTTP_PORT CADDY_HTTPS_PORT
   RAKAZO_WEB_BIND DOCKER_SOCKET_PATH
@@ -56,11 +70,20 @@ SECRET_KEYS=(BETTER_AUTH_SECRET ENCRYPTION_KEY SCREEN_PROXY_SECRET SANDBOX_SUPER
 
 declare -A CUR=()  # values from the existing .env
 declare -A NEW=()  # values to write
+declare -A PF=()   # values from postfix/postfix.env
 CUSTOM_LINES=()    # custom entries, copied unchanged
 DROPPED_KEYS=()
+DONE=()            # what this run wrote, for the summary
+CADDY_TODO=()      # commands left to the user when the Caddy file was not written
+CADDY_ROW=""       # Caddy line of the summary
+RUN=()             # sudo when the current target needs it (see root_for)
 PORTS_CHANGED=0
 MODELS=""          # model IDs from the last fetch_models
-BACKUP=""          # backup of the previous .env
+MAIL_MODE=""       # receive, send, receive+send or empty
+OLD_MAIL=""        # the same for the existing deployment
+MAIL_DOMAIN=""     # domain of the mail addresses (after the @)
+MAIL_PASSWORD=""   # its SMTP password
+IPV4="" IPV6=""    # public addresses of this host, empty when unknown
 
 die()  { printf '\nError: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'Warning: %s\n' "$*" >&2; }
@@ -86,6 +109,33 @@ load_env() {
       CUSTOM_LINES+=("$line")
     fi
   done <"$ENV_FILE"
+}
+
+# postfix/postfix.env into PF, and the mail mode it holds while COMPOSE_PROFILES has mail into OLD_MAIL.
+load_postfix_env() {
+  local line
+  if [[ -r postfix/postfix.env ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      if [[ $line =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then PF[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}; fi
+    done <postfix/postfix.env
+  fi
+  MAIL_DOMAIN=${PF[ALLOWED_SENDER_DOMAINS]:-}
+  [[ ,${CUR[COMPOSE_PROFILES]:-}, == *,mail,* ]] || return 0
+  [[ -z ${PF[POSTFIX_relay_domains]:-} ]] || OLD_MAIL=receive
+  [[ -z ${PF[SMTPD_SASL_USERS]:-} ]] || OLD_MAIL+=${OLD_MAIL:++}send
+}
+
+as_root() { if ((EUID == 0)); then "$@"; else sudo "$@"; fi; }
+
+# root_for FILE – RUN=() when this user may write FILE, otherwise asks once and sets RUN=(sudo).
+# Returns 1 when the user declines.
+root_for() {
+  local dir=${1%/*}
+  RUN=()
+  ((EUID == 0)) && return 0
+  [[ -w ${dir:-/} && (! -e $1 || -w $1) ]] && return 0
+  ask_yn "$1 needs root. Write it with sudo" y || return 1
+  RUN=(sudo)
 }
 
 # --- Input ---------------------------------------------------------------------------------------
@@ -181,6 +231,169 @@ env_line() {
   else
     printf "%s='%s'\n" "$key" "$val"
   fi
+}
+
+# --- Deployment directory ------------------------------------------------------------------------
+
+# Creates the deployment directory if needed, owned by the user running the script so that the
+# script and docker compose (group docker) work there without sudo, and enters it.
+enter_deploy_dir() {
+  local group
+  group=$(id -gn "$OWNER_USER")
+  if [[ ! -d $DEPLOY_DIR ]] && ! { mkdir -p "${DEPLOY_DIR%/*}" && mkdir -m 750 "$DEPLOY_DIR"; } 2>/dev/null; then
+    printf 'Creating %s needs root. It will belong to %s, so that this script and\n' "$DEPLOY_DIR" "$OWNER_USER"
+    printf 'docker compose work there without sudo.\n'
+    if ! ask_yn "Create it with sudo" y; then
+      printf 'Create it yourself, then run the script again:\n  sudo install -d -o %s -g %s -m 750 %s\n' \
+        "$OWNER_USER" "$group" "$DEPLOY_DIR"
+      exit 1
+    fi
+    sudo install -d -o "$OWNER_USER" -g "$group" -m 750 "$DEPLOY_DIR" || die "Could not create $DEPLOY_DIR."
+    DONE+=("$DEPLOY_DIR created, owned by $OWNER_USER")
+  elif [[ ! -w $DEPLOY_DIR ]] && ((EUID != 0)); then
+    printf '%s belongs to %s; this script and docker compose need it to belong to %s.\n' \
+      "$DEPLOY_DIR" "$(stat -c %U "$DEPLOY_DIR")" "$OWNER_USER"
+    if ! ask_yn "Hand it over with sudo chown" y; then
+      printf 'Then:\n  sudo chown %s:%s %s\n' "$OWNER_USER" "$group" "$DEPLOY_DIR"
+      exit 1
+    fi
+    sudo chown "$OWNER_USER:$group" "$DEPLOY_DIR" || die "Could not change the owner of $DEPLOY_DIR."
+  fi
+  if ((EUID == 0)) && [[ $OWNER_USER != root && $(stat -c %U "$DEPLOY_DIR") == root ]]; then
+    chown "$OWNER_USER:$group" "$DEPLOY_DIR"
+  fi
+  cd "$DEPLOY_DIR"
+}
+
+# For --check, --owner and the account commands: enter the directory of an existing deployment.
+use_deploy_dir() {
+  if [[ ! -f $DEPLOY_DIR/$ENV_FILE ]]; then
+    legacy_install &&
+      die "This install still runs from the checkout. Run $SELF to move it to $DEPLOY_DIR, or add --dir $REPO_DIR."
+    die "No .env in $DEPLOY_DIR. Run $SELF first."
+  fi
+  cd "$DEPLOY_DIR"
+}
+
+# The layout before /opt/rakazo: .env and data/ next to the script.
+legacy_install() { [[ ! $REPO_DIR -ef $DEPLOY_DIR && (-f $REPO_DIR/$ENV_FILE || -d $REPO_DIR/data) ]]; }
+
+# listing DIR ITEM… – path, type, size, owner and mode of everything below ITEM, sorted
+listing() {
+  local dir=$1
+  shift
+  (cd "$dir" && "${RUN[@]}" find "$@" \( -type d -printf '%p d %U:%G %m\n' \) -o -printf '%p %y %s %U:%G %m %l\n') |
+    LC_ALL=C sort
+}
+
+# Moves .env, its backups, data/ and credentials/ of the old layout into the deployment directory:
+# renamed on the same file system, otherwise copied with the originals kept as a backup.
+migrate_legacy() {
+  local items=() i same=1 before after keep="" moved=()
+  if [[ -f $DEPLOY_DIR/$ENV_FILE ]]; then
+    warn "$REPO_DIR still holds .env or data/ of the old layout; $DEPLOY_DIR is used."
+    enter_deploy_dir
+    return 0
+  fi
+  for i in "$REPO_DIR/$ENV_FILE" "$REPO_DIR/$ENV_FILE".bak.* "$REPO_DIR/data" "$REPO_DIR/credentials"; do
+    if [[ -e $i ]]; then items+=("${i##*/}"); fi
+  done
+  section "Move the install to $DEPLOY_DIR"
+  printf 'Rakazo now runs from %s instead of the checkout. Found in %s:\n' "$DEPLOY_DIR" "$REPO_DIR"
+  printf '  %s\n' "${items[*]}"
+  printf 'Moving them:\n'
+  printf '  1. stops the stack: docker compose down in the checkout (data stays, computers keep running)\n'
+  printf '  2. moves them to %s with owners and modes (postgres and app data belong to the\n' "$DEPLOY_DIR"
+  printf '     container users, so this uses sudo)\n'
+  printf '  3. compares owners, modes and sizes on both sides\n'
+  if ! ask_yn "Move the install now" y; then
+    printf 'Nothing changed. To keep running from the checkout: %s/generate-env.sh --dir %s\n' "$REPO_DIR" "$REPO_DIR"
+    exit 0
+  fi
+  enter_deploy_dir
+  for i in "${items[@]}"; do
+    [[ ! -e $i ]] || die "$DEPLOY_DIR/$i already exists. Move it away first; nothing was changed."
+    [[ $(stat -c %d "$REPO_DIR/$i") == $(stat -c %d .) ]] || same=0
+  done
+  RUN=()
+  if ((EUID != 0)) && ! ask_yn "Use sudo for the move" y; then
+    printf 'Nothing changed. By hand:\n  cd %s && docker compose down\n' "$REPO_DIR"
+    if ((same)); then
+      printf '  cd %s && sudo mv %s %s/\n' "$REPO_DIR" "${items[*]}" "$DEPLOY_DIR"
+    else
+      printf '  cd %s && sudo cp -a %s %s/\n' "$REPO_DIR" "${items[*]}" "$DEPLOY_DIR"
+      printf '  then move the originals out of the checkout once Rakazo runs from %s\n' "$DEPLOY_DIR"
+    fi
+    printf 'and run %s again.\n' "$SELF"
+    exit 1
+  fi
+  ((EUID == 0)) || RUN=(sudo)
+  (cd "$REPO_DIR" && docker compose down) || die "Could not stop the stack in $REPO_DIR; nothing was moved."
+  before=$(listing "$REPO_DIR" "${items[@]}") || die "Could not list ${items[*]} in $REPO_DIR; nothing was moved."
+  for i in "${items[@]}"; do
+    if ((same)); then
+      "${RUN[@]}" mv -- "$REPO_DIR/$i" "$i" ||
+        die "Moving $i failed. Already in $DEPLOY_DIR: ${moved[*]:-nothing}; the rest is still in $REPO_DIR."
+    else
+      "${RUN[@]}" cp -a -- "$REPO_DIR/$i" "$i" ||
+        die "Copying $i failed. The originals in $REPO_DIR are unchanged; remove the partial copies in $DEPLOY_DIR."
+    fi
+    moved+=("$i")
+  done
+  after=$(listing . "${items[@]}")
+  if [[ $before != "$after" ]]; then
+    diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -20 >&2 || true
+    if ((same)); then die "After the move the files differ from before (see above). Check $DEPLOY_DIR."; fi
+    die "The copies differ from the originals (see above). The originals in $REPO_DIR are unchanged."
+  fi
+  if ((!same)); then
+    keep=migrated-$STAMP
+    mkdir "$REPO_DIR/$keep"
+    for i in "${items[@]}"; do "${RUN[@]}" mv -- "$REPO_DIR/$i" "$REPO_DIR/$keep/"; done
+  fi
+  DONE+=("Moved ${items[*]} from $REPO_DIR (same files, owners, modes and sizes)")
+  [[ -z $keep ]] || DONE+=("Originals kept in $REPO_DIR/$keep; delete them once Rakazo runs from $DEPLOY_DIR")
+  deploy_file docker-compose.yml
+  printf 'Moved and checked. The stack is stopped; to start it from the new place right away:\n'
+  printf '  cd %s && docker compose up -d\n' "$DEPLOY_DIR"
+  printf 'The settings below start from the moved .env and also update Caddy and the DNS list.\n'
+}
+
+# deploy_file PATH – copies PATH from the checkout; a copy that differs is backed up first. Sets
+# COPIED to 0 (unchanged), 1 (new) or 2 (replaced).
+deploy_file() {
+  local f=$1
+  COPIED=0
+  if cmp -s "$REPO_DIR/$f" "$f"; then return 0; fi
+  COPIED=1
+  if [[ -f $f ]]; then cp -p "$f" "$f.bak.$STAMP"; COPIED=2; fi
+  mkdir -p "$(dirname "$f")"
+  cp "$REPO_DIR/$f" "$f.tmp.$$"
+  mv -f "$f.tmp.$$" "$f"
+}
+
+deploy_files() {
+  local f files=(docker-compose.yml) copied=() kept=""
+  [[ $REPO_DIR -ef . ]] && return 0
+  [[ -z $MAIL_MODE ]] || files+=(postfix/rakazo.sh postfix/rakazo-inbound-email)
+  for f in "${files[@]}"; do
+    deploy_file "$f"
+    ((COPIED)) || continue
+    ((COPIED == 1)) || kept=", previous versions kept as *.bak.$STAMP"
+    copied+=("$f")
+  done
+  ((${#copied[@]} == 0)) || DONE+=("Copied from the checkout: $(join "${copied[@]}" | sed 's/,/, /g')$kept")
+}
+
+# A run as root leaves the files to the user the deployment directory belongs to.
+hand_over() {
+  local f group
+  ((EUID == 0)) && [[ $OWNER_USER != root ]] || return 0
+  group=$(id -gn "$OWNER_USER")
+  for f in "$ENV_FILE" "$ENV_FILE".bak.* docker-compose* dns-records.txt ./*.new data credentials; do
+    if [[ -e $f ]]; then chown "$OWNER_USER:$group" "$f"; fi
+  done
+  if [[ -d postfix ]]; then chown -R "$OWNER_USER:$group" postfix; fi
 }
 
 # --- Generate ------------------------------------------------------------------------------------
@@ -353,13 +566,103 @@ step_computers() {
   if [[ ${CUR[SANDBOX_IDLE_MS]:-0} != 0 ]]; then NEW[SANDBOX_IDLE_MS]=${CUR[SANDBOX_IDLE_MS]}; fi
 }
 
+# remote_proxy CUR|NEW – does a reverse proxy on another machine replace Caddy on this host?
+remote_proxy() {
+  local -n rp=$1
+  [[ ${rp[RAKAZO_BIND]:-127.0.0.1} != 127.0.0.1 && -n ${rp[TRUSTED_PROXIES]:-} ]]
+}
+
+# Is Caddy the packaged service, with its data in /var/lib/caddy/.local/share/caddy?
+caddy_packaged() {
+  [[ $(systemctl show -p User --value caddy 2>/dev/null) == caddy && $(getent passwd caddy | cut -d: -f6) == /var/lib/caddy ]]
+}
+
+step_mail() {
+  local mode def=1 domain old_domain from host=${NEW[RAKAZO_HOST]} pw=${PF[SMTPD_SASL_USERS]:-}
+  MAIL_MODE="" NEW[COMPOSE_PROFILES]=""
+  printf '\n== Mail server (optional) ==\n'
+  if remote_proxy NEW; then
+    printf 'Postfix gets its certificate from Caddy on this host; with a reverse proxy on another\n'
+    printf 'machine that is not available.\n'
+    return 0
+  elif ! caddy_packaged; then
+    printf 'Postfix uses the certificate of Caddy from its Debian or RPM package (data in\n'
+    printf '/var/lib/caddy/.local/share/caddy). Install that Caddy, then run this script again.\n'
+    return 0
+  fi
+  printf 'Postfix in a container next to Rakazo, as mail server %s with Caddy'"'"'s certificate for\n' "$host"
+  printf 'it. Addresses are name@<mail domain>: %s itself or a domain whose MX points to it.\n' "$host"
+  if on_edge; then
+    printf 'Receiving: Postfix takes mail for every name@<mail domain> and posts it to Rakazo, so bots get\n'
+    printf 'email addresses. Sending: Rakazo has one way to send, so Postfix then carries all its mail,\n'
+    printf 'account mail (verification, password resets, sign-in codes) included.\n'
+  else
+    printf 'Rakazo has one way to send, so Postfix then carries all its mail: verification, password\n'
+    printf 'resets and sign-in codes.\n'
+  fi
+  printf 'Sending from this host needs outbound port 25 (many hosters block it until asked) and a PTR\n'
+  printf 'record, and a new IP has no reputation yet; a relay such as Amazon SES (Email step) is safer.\n'
+  if on_edge; then
+    case $OLD_MAIL in receive) def=2 ;; *send) def=3 ;; esac
+    choose mode "$def" "none" "receive bot email; sending stays with the Email step (Resend or any SMTP)" \
+      "receive and send, account mail included"
+    case $mode in 2) MAIL_MODE=receive ;; 3) MAIL_MODE=receive+send ;; esac
+  else
+    [[ $OLD_MAIL == *send ]] && def=2
+    choose mode "$def" "none" "send Rakazo's mail, account mail included"
+    ((mode == 1)) || MAIL_MODE=send
+  fi
+  [[ -n $MAIL_MODE ]] || return 0
+
+  [[ $MAIL_MODE == send ]] ||
+    printf 'Every name@<mail domain> goes to the bots: use a domain without mailboxes of its own.\n'
+  old_domain=${PF[ALLOWED_SENDER_DOMAINS]:-${CUR[INBOUND_EMAIL_DOMAIN]:-$host}}
+  [[ $old_domain != "${CUR[RAKAZO_HOST]:-}" ]] || old_domain=$host
+  while :; do
+    ask domain "Mail domain, the part after @" "$old_domain"
+    domain=$(normalize_host "${domain#@}")
+    valid_host "$domain" && break
+    warn "\"$domain\" is not a valid domain name."
+  done
+  MAIL_DOMAIN=$domain NEW[COMPOSE_PROFILES]=mail
+  MAIL_PASSWORD=$(keep_or_new "${pw#*:}" 32)
+  if [[ $MAIL_MODE == receive* ]]; then
+    NEW[INBOUND_EMAIL_DOMAIN]=$domain
+    NEW[INBOUND_EMAIL_SECRET]=$(keep_or_new "${CUR[INBOUND_EMAIL_SECRET]:-}" 32)
+  fi
+  [[ $MAIL_MODE == *send ]] || return 0
+
+  from=${CUR[EMAIL_FROM]:-}
+  [[ $from == *"@$domain>"* || $from == *"@$domain" ]] || from="Rakazo <no-reply@$domain>"
+  while :; do
+    ask from "Sender" "$from"
+    if [[ ! $from =~ [^@[:space:]\<]+@([^@[:space:]\>]+) ]]; then
+      warn "The sender needs an email address, e.g. Rakazo <no-reply@$domain>."
+    elif [[ ${BASH_REMATCH[1],,} != "$domain" ]]; then
+      warn "Postfix sends as name@$domain only."
+    else
+      break
+    fi
+  done
+  NEW[EMAIL_PROVIDER]=smtp NEW[EMAIL_API_KEY]="" NEW[EMAIL_FROM]=$from
+  NEW[SMTP_URL]="smtp://rakazo%40$host:$MAIL_PASSWORD@postfix:587/?tls.servername=$host"
+}
+
 step_email() {
-  local mode def=1 key from smtp
+  local mode def=1 key from smtp old_smtp=${CUR[SMTP_URL]:-} old_provider=${CUR[EMAIL_PROVIDER]:-}
+  # Set by step_mail: Postfix sends.
+  [[ $MAIL_MODE != *send ]] || return 0
+  # An SMTP_URL to the Postfix of this stack must not outlive it.
+  [[ $old_smtp != smtp://rakazo*@postfix:587* ]] || old_smtp="" old_provider=""
   printf '\n== Email ==\n'
   printf 'For verification mails, password resets and sign-in codes. Without email there is no\n'
   printf 'password recovery, and an allowlist only works with SSO.\n'
-  if [[ ${CUR[EMAIL_PROVIDER]:-} == resend ]]; then def=2
-  elif [[ -n ${CUR[SMTP_URL]:-} || ${CUR[EMAIL_PROVIDER]:-} == smtp ]]; then def=3; fi
+  if [[ $MAIL_MODE == receive ]]; then
+    printf 'Bots also send through it as name@%s: the provider must be allowed to send as\n' "$MAIL_DOMAIN"
+    printf 'that domain.\n'
+  fi
+  if [[ $old_provider == resend ]]; then def=2
+  elif [[ -n $old_smtp || $old_provider == smtp ]]; then def=3; fi
   choose mode "$def" "none" "Resend (HTTP API)" "SMTP (e.g. Amazon SES, Resend SMTP, your own server)"
   NEW[EMAIL_PROVIDER]="" NEW[EMAIL_API_KEY]="" NEW[SMTP_URL]="" NEW[EMAIL_FROM]=""
   ((mode == 1)) && return
@@ -374,7 +677,7 @@ step_email() {
     printf 'Format: smtps://user:password@host:465 (TLS) or smtp://…:587 (STARTTLS).\n'
     printf 'URL-encode special characters in user/password (@ → %%40, : → %%3A, / → %%2F).\n'
     while :; do
-      ask_secret smtp "SMTP_URL" "${CUR[SMTP_URL]:-}"
+      ask_secret smtp "SMTP_URL" "$old_smtp"
       [[ $smtp =~ ^smtps?://[^[:space:]]+$ ]] && break
       warn "SMTP_URL must start with smtps:// or smtp://."
     done
@@ -391,20 +694,25 @@ step_email() {
 
 step_bot_email() {
   local def=n domain
+  # Set by step_mail: Postfix receives.
+  [[ $MAIL_MODE != receive* ]] || return 0
   NEW[INBOUND_EMAIL_DOMAIN]=${CUR[INBOUND_EMAIL_DOMAIN]:-} NEW[INBOUND_EMAIL_SECRET]=${CUR[INBOUND_EMAIL_SECRET]:-}
+  # Postfix of this stack was the relay: its domain does not outlive it.
+  [[ $OLD_MAIL != receive* ]] || NEW[INBOUND_EMAIL_DOMAIN]="" NEW[INBOUND_EMAIL_SECRET]=""
   on_edge || return 0
   printf '\n== Bot email addresses (edge, optional) ==\n'
   printf 'Each bot can get name@<mail domain>: mail to it lands in its inbox (e.g. sign-up codes) and can\n'
   printf 'start routines. Needs a domain that receives mail for every name and a relay that posts each\n'
-  printf 'message to Rakazo (Cloudflare Email Routing or Postfix). Bots send through the email above;\n'
-  printf 'the provider must be allowed to send as that domain.\n'
+  printf 'message to Rakazo, here an outside one such as Cloudflare Email Routing (Postfix on this host is\n'
+  printf 'the mail server step). Bots send through the email above; the provider must be allowed to send\n'
+  printf 'as that domain.\n'
   [[ -n ${NEW[INBOUND_EMAIL_DOMAIN]} ]] && def=y
   if ! ask_yn "Give bots email addresses" "$def"; then
     NEW[INBOUND_EMAIL_DOMAIN]="" NEW[INBOUND_EMAIL_SECRET]=""
     return 0
   fi
   while :; do
-    ask domain "Mail domain used for nothing else (e.g. bots.example.com)" "${NEW[INBOUND_EMAIL_DOMAIN]}"
+    ask domain "Mail domain used for nothing else (e.g. agents.example.com)" "${NEW[INBOUND_EMAIL_DOMAIN]}"
     domain=$(normalize_host "${domain#@}")
     valid_host "$domain" && break
     warn "\"$domain\" is not a valid domain name."
@@ -778,11 +1086,11 @@ step_secrets() {
 }
 
 write_env() {
-  local tmp backup line
+  local tmp backup="" line
   tmp=$(mktemp "$ENV_FILE.XXXXXX")
   {
     printf '# Rakazo – written by generate-env.sh on %s. Contains secrets: do not commit or share.\n' "$(date '+%Y-%m-%d %H:%M')"
-    printf '# To change: run ./generate-env.sh again. Then: docker compose up -d\n'
+    printf '# To change: run %s/generate-env.sh again. Then here: docker compose up -d\n' "$REPO_DIR"
     cat <<'EOF'
 
 # --- Access ---------------------------------------------------------------------------------------
@@ -798,9 +1106,9 @@ EOF
 
 # --- Ports ----------------------------------------------------------------------------------------
 # RAKAZO_BIND: 127.0.0.1 = only this host, where Caddy forwards to them. 0.0.0.0 or a host IP
-# serves web and API without TLS and past ufw. After a change update the upstreams in
-# /etc/caddy/rakazo.caddy, reload Caddy and run docker compose up -d. TRUSTED_PROXIES lists a
-# reverse proxy on another machine, so the API believes its X-Forwarded-For.
+# serves web and API without TLS and past ufw. Change them with generate-env.sh, which also updates
+# the Caddy file, then docker compose up -d. TRUSTED_PROXIES lists a reverse proxy on another
+# machine, so the API believes its X-Forwarded-For.
 EOF
     env_line RAKAZO_BIND
     env_line RAKAZO_WEB_PORT
@@ -810,8 +1118,8 @@ EOF
 
 # --- Images ---------------------------------------------------------------------------------------
 # latest = newest release, edge = development state of main. Apply a change or an update with
-# docker compose pull && docker compose up -d
 EOF
+    printf '# docker compose pull && docker compose up -d\n'
     env_line RAKAZO_IMAGE_TAG
     cat <<'EOF'
 
@@ -853,6 +1161,9 @@ EOF
       "${NEW[RAKAZO_HOST]}"
     env_line SCIM_BEARER_TOKEN
     printf '\n# --- Email (optional) ----------------------------------------------------------------------------\n'
+    if [[ $MAIL_MODE == *send ]]; then
+      printf '# SMTP_URL points to Postfix in this stack (mail server below); generate-env.sh sets it.\n'
+    fi
     env_line EMAIL_PROVIDER
     env_line EMAIL_API_KEY
     env_line SMTP_URL
@@ -860,8 +1171,17 @@ EOF
     printf '\n# --- Bot email addresses (edge, optional) ---------------------------------------------------------\n'
     printf '# The relay posts each message to https://%s/api/v1/email/inbound?to=<recipient>\n' "${NEW[RAKAZO_HOST]}"
     printf '# with Authorization: Bearer <INBOUND_EMAIL_SECRET>; see docs/self-host-inbound-email.md.\n'
+    if [[ $MAIL_MODE == receive* ]]; then
+      printf '# Postfix in this stack is that relay (mail server below); generate-env.sh sets both.\n'
+    fi
     env_line INBOUND_EMAIL_DOMAIN
     env_line INBOUND_EMAIL_SECRET
+    cat <<'EOF'
+
+# --- Mail server (optional) -----------------------------------------------------------------------
+# mail = Postfix runs (settings and DKIM key in postfix/, written by generate-env.sh); empty = off.
+EOF
+    env_line COMPOSE_PROFILES
     printf '\n# --- SSO (optional) ------------------------------------------------------------------------------\n'
     printf '# Redirect URI at the provider: https://%s/api/auth/callback/oidc\n' "${NEW[RAKAZO_HOST]}"
     env_line OIDC_ISSUER
@@ -908,11 +1228,259 @@ EOF
   } >"$tmp"
   chmod 600 "$tmp"
   if [[ -f $ENV_FILE ]]; then
-    BACKUP=$ENV_FILE.bak.$(date +%Y%m%d-%H%M%S)
-    cp -p "$ENV_FILE" "$BACKUP"
-    chmod 600 "$BACKUP"
+    backup=$ENV_FILE.bak.$STAMP
+    cp -p "$ENV_FILE" "$backup"
+    chmod 600 "$backup"
   fi
   mv "$tmp" "$ENV_FILE"
+  DONE+=(".env written (mode 600)${backup:+, previous file backed up as $backup}")
+}
+
+# postfix/postfix.env (mode 600) and, for sending, the DKIM key; both stay when mail is off.
+write_postfix() {
+  local key=postfix/dkim/$MAIL_DOMAIN.private tls=/tls/$LE_STORE/${NEW[RAKAZO_HOST]}/${NEW[RAKAZO_HOST]} tmp
+  [[ -n $MAIL_MODE ]] || return 0
+  mkdir -p postfix/dkim
+  chmod 755 postfix postfix/dkim
+  if [[ $MAIL_MODE == *send && ! -f $key ]]; then
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$key.tmp" 2>/dev/null ||
+      die "openssl could not create the DKIM key."
+    chmod 644 "$key.tmp"
+    mv "$key.tmp" "$key"
+    DONE+=("New DKIM key $key (RSA 2048)")
+  fi
+  tmp=$(mktemp postfix/postfix.env.XXXXXX)
+  {
+    printf 'POSTFIX_myhostname=%s\n' "${NEW[RAKAZO_HOST]}"
+    printf 'POSTFIX_mynetworks=127.0.0.0/8\n'
+    printf 'POSTFIX_smtpd_client_restrictions=permit\n'
+    printf 'POSTFIX_smtpd_sender_restrictions=reject_sender_login_mismatch\n'
+    printf 'POSTFIX_smtpd_sender_login_maps=inline:{ @%s=rakazo@%s }\n' "$MAIL_DOMAIN" "${NEW[RAKAZO_HOST]}"
+    printf 'POSTFIX_smtpd_relay_restrictions=permit_mynetworks,permit_sasl_authenticated,reject_unauth_destination\n'
+    printf 'POSTFIX_smtpd_recipient_restrictions=permit_mynetworks,permit_sasl_authenticated,reject_unauth_destination\n'
+    printf 'POSTFIX_smtpd_sasl_auth_enable=no\n'
+    printf 'POSTFIX_smtpd_tls_auth_only=yes\n'
+    printf 'POSTFIX_smtpd_tls_security_level=may\n'
+    printf 'POSTFIX_smtpd_tls_cert_file=%s.crt\n' "$tls"
+    printf 'POSTFIX_smtpd_tls_key_file=%s.key\n' "$tls"
+    printf 'POSTFIX_message_size_limit=26214400\n'
+    printf 'POSTFIX_rakazo_destination_recipient_limit=1\n'
+    if [[ $MAIL_MODE == receive* ]]; then
+      printf 'POSTFIX_relay_domains=%s\n' "$MAIL_DOMAIN"
+      printf 'POSTFIX_transport_maps=inline:{ %s=rakazo: }\n' "$MAIL_DOMAIN"
+      printf 'INBOUND_SECRET=%s\n' "${NEW[INBOUND_EMAIL_SECRET]}"
+    else
+      printf 'POSTFIX_relay_domains=\nPOSTFIX_transport_maps=\nINBOUND_SECRET=\n'
+    fi
+    printf 'ALLOWED_SENDER_DOMAINS=%s\n' "$MAIL_DOMAIN"
+    printf 'SMTPD_SASL_USERS=%s\n' "$([[ $MAIL_MODE != *send ]] || printf 'rakazo@%s:%s' "${NEW[RAKAZO_HOST]}" "$MAIL_PASSWORD")"
+    printf 'DKIM_BACKEND=opendkim\nDKIM_SELECTOR=rakazo\n'
+  } >"$tmp"
+  mv "$tmp" postfix/postfix.env
+  DONE+=("postfix/postfix.env written (mode 600)")
+}
+
+# --- Caddy ---------------------------------------------------------------------------------------
+
+# render_caddy CUR|NEW – the template with domain and upstreams filled in
+render_caddy() {
+  local -n rc=$1
+  local t up
+  up=$(upstream_ip "${rc[RAKAZO_BIND]:-127.0.0.1}")
+  t=$(<"$REPO_DIR/Caddyfile.example")
+  t=${t//127.0.0.1:$DEFAULT_WEB_PORT /@WEB@ } t=${t//127.0.0.1:$DEFAULT_API_PORT /@API@ }
+  t=${t//@WEB@/$up:${rc[RAKAZO_WEB_PORT]:-}} t=${t//@API@/$up:${rc[RAKAZO_API_PORT]:-}}
+  printf '%s\n' "${t//rakazo.example.com/${rc[RAKAZO_HOST]:-}}"
+}
+
+# caddy_default FILE – only comments or the :80 site the caddy package ships?
+caddy_default() {
+  local s
+  s=$(grep -v '^[[:space:]]*\(#\|$\)' "$1" 2>/dev/null | tr -s '[:space:]' ' ' || true)
+  s=$(trim "$s")
+  [[ -r $1 && (-z $s || $s == ':80 { root * /usr/share/caddy file_server }') ]]
+}
+
+show_diff() { # show_diff FILE NEW_CONTENT
+  diff -u --label "$1 (now)" --label "$1 (new)" "$1" <(printf '%s' "$2") | sed 's/^/  /' || true
+}
+
+# caddy_write FILE CONTENT – backs FILE up and replaces it, with sudo after asking if needed.
+# Returns 1 when the user declines sudo.
+caddy_write() {
+  local f=$1 tmp
+  root_for "$f" || return 1
+  tmp=$(mktemp)
+  printf '%s' "$2" >"$tmp"
+  if [[ -e $f ]]; then
+    "${RUN[@]}" cp -p "$f" "$f.bak.$STAMP"
+    "${RUN[@]}" cp "$tmp" "$f"
+    DONE+=("$f written, previous file backed up as $f.bak.$STAMP")
+  else
+    "${RUN[@]}" install -m 644 "$tmp" "$f"
+    DONE+=("$f written")
+  fi
+  rm -f "$tmp"
+}
+
+# caddy_manual FILE CONTENT – keeps CONTENT in the deployment directory and leaves the commands
+# for the next steps.
+caddy_manual() {
+  local f=$1 new=$DEPLOY_DIR/${1##*/}.new
+  printf '%s' "$2" >"$new"
+  CADDY_TODO=()
+  [[ ! -e $f ]] || CADDY_TODO+=("sudo cp -p $f $f.bak.$STAMP")
+  CADDY_TODO+=("sudo cp $new $f   (or merge the Rakazo site block into it)"
+    "sudo caddy validate --config $f --adapter caddyfile && sudo systemctl reload caddy")
+  CADDY_ROW="not written; $new is ready (next steps)"
+  printf 'Not written. %s holds the new version; the commands are in the next steps.\n' "$new"
+}
+
+# Writes the Caddy file from the template: directly when it is missing or the package default,
+# otherwise after showing the diff. Then caddy validate and, if wanted, a reload.
+step_caddy() {
+  local f=$CADDY_FILE content def=n out
+  CADDY_ROW="" CADDY_TODO=()
+  remote_proxy NEW && return 0
+  section Caddy
+  content=$(render_caddy NEW)$'\n'
+  if ! command -v caddy >/dev/null; then
+    printf 'Caddy is not installed. Install it (https://caddyserver.com/docs/install), then run this\n'
+    printf 'script again: it writes %s.\n' "$f"
+    CADDY_ROW="not installed"
+    CADDY_TODO=("install Caddy (https://caddyserver.com/docs/install), then run $SELF again")
+    return 0
+  fi
+  if [[ -f $f ]] && cmp -s "$f" <(printf '%s' "$content"); then
+    printf '%s is up to date.\n' "$f"
+    CADDY_ROW="$f, up to date"
+    return 0
+  fi
+  if [[ -e $f ]] && ! caddy_default "$f"; then
+    printf '%s has other content:\n' "$f"
+    show_diff "$f" "$content"
+    ! grep -qF "${NEW[RAKAZO_HOST]} {" "$f" || def=y
+    ask_yn "Replace it (backed up first)" "$def" || { caddy_manual "$f" "$content"; return 0; }
+  fi
+  caddy_write "$f" "$content" || { caddy_manual "$f" "$content"; return 0; }
+  CADDY_ROW="$f written from Caddyfile.example"
+  if ! out=$(caddy validate --config "$f" --adapter caddyfile 2>&1); then
+    # Caddy logs as JSON: show the messages of its errors and any plain lines.
+    sed -n -e '/^{/{s/^.*"level":"error".*"msg":"\([^"]*\)".*/  \1/p;d;}' -e 's/^/  /p' <<<"$out" | tail -n 5 >&2
+    warn "caddy validate rejects $f."
+    if [[ -e $f.bak.$STAMP ]] && ask_yn "Put back the previous $f" y; then
+      "${RUN[@]}" cp "$f.bak.$STAMP" "$f"
+      DONE+=("$f restored from $f.bak.$STAMP after caddy validate failed")
+    fi
+    CADDY_ROW="caddy validate fails: fix $f (next steps)"
+    CADDY_TODO=("fix $f, then: sudo caddy validate --config $f --adapter caddyfile && sudo systemctl reload caddy")
+    return 0
+  fi
+  printf 'caddy validate: the configuration is valid.\n'
+  if ! systemctl is-active --quiet caddy 2>/dev/null; then
+    CADDY_TODO=("sudo systemctl enable --now caddy   (Caddy is not running)")
+  elif ask_yn "Reload Caddy now (sudo systemctl reload caddy)" y && as_root systemctl reload caddy; then
+    DONE+=("Caddy reloaded")
+    CADDY_ROW+=", reloaded"
+  else
+    CADDY_TODO=("sudo systemctl reload caddy")
+  fi
+}
+
+# Creates Caddy's certificates folder for Postfix's mount before Docker would create it as root.
+caddy_certs() {
+  [[ -n $MAIL_MODE && ! -d $CADDY_CERTS ]] || return 0
+  printf 'Postfix mounts %s; created by Docker it would belong to root and\n' "$CADDY_CERTS"
+  printf 'Caddy could no longer store certificates.\n'
+  if ask_yn "Create it as Caddy's user if missing (sudo -u caddy mkdir -p)" y &&
+    if ((EUID == 0)); then runuser -u caddy -- mkdir -p -m 700 "$CADDY_CERTS"
+    else sudo -u caddy mkdir -p -m 700 "$CADDY_CERTS"; fi; then
+    DONE+=("$CADDY_CERTS exists for Caddy")
+  else
+    CADDY_TODO+=("sudo -u caddy mkdir -p -m 700 $CADDY_CERTS")
+  fi
+}
+
+# --- DNS -----------------------------------------------------------------------------------------
+
+public_ipv4() {
+  valid_ipv4 "$1" && [[ ! $1 =~ ^(0|10|127)\. && ! $1 =~ ^(169\.254|192\.168)\. &&
+    ! $1 =~ ^172\.(1[6-9]|2[0-9]|3[01])\. && ! $1 =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]
+}
+public_ipv6() { [[ ${1,,} =~ ^[23][0-9a-f]{0,3}:[0-9a-f:]+$ ]]; }
+
+# Public addresses of this host: the source address towards the internet if that is public, else
+# empty (the DNS text then shows a placeholder).
+detect_ips() {
+  local a
+  a=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' || true)
+  if public_ipv4 "$a"; then IPV4=$a; fi
+  a=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | sed -n 's/.* src \([0-9a-f:]*\).*/\1/p' || true)
+  if public_ipv6 "$a"; then IPV6=${a,,}; fi
+}
+
+# The DKIM record value for the key in postfix/dkim/: the public key as base64 DER
+# (SubjectPublicKeyInfo).
+dkim_value() {
+  local p
+  p=$(openssl pkey -in "postfix/dkim/$MAIL_DOMAIN.private" -pubout -outform DER 2>/dev/null | base64 -w 0 || true)
+  printf 'v=DKIM1; k=rsa; p=%s' "${p:-<key missing: run generate-env.sh>}"
+}
+
+# dns_records CUR|NEW MAIL_MODE – "name|type|priority|value" for every record the setup needs
+dns_records() {
+  local -n dr=$1
+  local m=$2 h=${dr[RAKAZO_HOST]}
+  if remote_proxy dr; then
+    printf '%s|A||<IP of your reverse proxy>\n' "$h"
+    return 0
+  fi
+  printf '%s|A||%s\n' "$h" "${IPV4:-<public IPv4 of this host>}"
+  [[ -z $IPV6 ]] || printf '%s|AAAA||%s\n' "$h" "$IPV6"
+  [[ $m != receive* ]] || printf '%s|MX|10|%s\n' "$MAIL_DOMAIN" "$h"
+  if [[ $m == *send ]]; then
+    printf '%s|TXT||v=spf1 a:%s -all\n' "$MAIL_DOMAIN" "$h"
+    printf 'rakazo._domainkey.%s|TXT||%s\n' "$MAIL_DOMAIN" "$(dkim_value)"
+    printf '_dmarc.%s|TXT||v=DMARC1; p=quarantine\n' "$MAIL_DOMAIN"
+  fi
+}
+
+# txt_strings VALUE – VALUE as quoted strings of at most 255 characters
+txt_strings() {
+  local s=$1 out=""
+  while ((${#s})); do out+=" \"${s:0:255}\"" s=${s:255}; done
+  printf '%s' "${out# }"
+}
+
+# The records, PTR and ports as copy-ready text, for the summary and dns-records.txt.
+dns_text() {
+  local name type prio value w=4 dkim="" m=$MAIL_MODE rows=() r
+  mapfile -t rows < <(dns_records NEW "$m")
+  for r in "${rows[@]}"; do name=${r%%|*}; ((${#name} <= w)) || w=${#name}; done
+  printf '%-*s  %-4s  %-4s  %s\n' "$w" Name Type Prio Value
+  for r in "${rows[@]}"; do
+    IFS='|' read -r name type prio value <<<"$r"
+    printf '%-*s  %-4s  %-4s  %s\n' "$w" "$name" "$type" "$prio" "$value"
+    [[ $value != v=DKIM1* ]] || dkim=$value
+  done
+  if [[ -n $dkim ]]; then
+    printf '\nThe DKIM value as strings of at most 255 characters, for zone files and providers that want them:\n'
+    printf '%s\n' "$(txt_strings "$dkim")"
+  fi
+  if [[ $m == *send ]]; then
+    printf '\nReverse DNS (PTR), set at your hoster for the IPv4 address of this host:\n'
+    printf '%s  →  %s\n' "${IPV4:-<public IPv4 of this host>}" "${NEW[RAKAZO_HOST]}"
+  fi
+  printf '\nNames are complete; some DNS providers want only the part before the zone.\n'
+  if remote_proxy NEW; then
+    printf 'Ports: your reverse proxy serves 80/tcp and 443/tcp.\n'
+    return 0
+  fi
+  printf 'Ports: open 80/tcp and 443/tcp (443/udp for HTTP/3)%s.\n' "$([[ $m != receive* ]] || echo ' and 25/tcp inbound')"
+  if [[ $m == receive* ]]; then
+    printf 'Port 25 is published on IPv4 only, past ufw: ufw rules neither open nor close it.\n'
+  fi
+  [[ $m != *send ]] || printf 'Sending needs outbound 25/tcp, which many hosters block until you ask.\n'
 }
 
 # --- Result --------------------------------------------------------------------------------------
@@ -921,9 +1489,9 @@ section() { printf '\n== %s ==\n' "$1"; }
 row() { printf '  %-17s %s\n' "$1" "$2"; }
 
 summary() {
-  local k ignored=() notes=()
-  section Done
-  printf '  .env written (mode 600)%s\n' "${BACKUP:+, previous file backed up as $BACKUP}"
+  local k ignored=() notes=() m=$MAIL_MODE
+  section "Done in $DEPLOY_DIR"
+  for k in "${DONE[@]}"; do printf '  %s\n' "$k"; done
 
   section Summary
   row Release "${NEW[RAKAZO_IMAGE_TAG]}"
@@ -931,7 +1499,11 @@ summary() {
   row Ports "web ${NEW[RAKAZO_BIND]}:${NEW[RAKAZO_WEB_PORT]}, API ${NEW[RAKAZO_BIND]}:${NEW[RAKAZO_API_PORT]}"
   [[ -z ${NEW[TRUSTED_PROXIES]} ]] || row "Trusted proxies" "${NEW[TRUSTED_PROXIES]}"
   row Computers "$([[ ${NEW[SANDBOX_IDLE_MS]} == 0 ]] && echo 'keep running when idle' || echo 'stop when idle')"
-  row Email "${NEW[EMAIL_PROVIDER]:-none}"
+  if [[ -n $m ]]; then
+    row "Mail server" "Postfix $(case $m in receive) echo receives ;; send) echo sends ;; *) echo 'receives and sends' ;; esac) for $MAIL_DOMAIN"
+  fi
+  if [[ $m == *send ]]; then row Email "Postfix on this host, as ${NEW[EMAIL_FROM]}"
+  else row Email "${NEW[EMAIL_PROVIDER]:-none}"; fi
   [[ -z $(edge_val INBOUND_EMAIL_DOMAIN) ]] || row "Bot email" "${NEW[INBOUND_EMAIL_DOMAIN]}"
   row SSO "${NEW[OIDC_ISSUER]:-off}"
   [[ -z $(edge_val SCIM_BEARER_TOKEN) ]] || row SCIM on
@@ -939,12 +1511,20 @@ summary() {
   row Admins "${NEW[RAKAZO_ADMIN_EMAILS]:-none}"
   row Model "$(deployment_model NEW)"
   row "App catalog" "$(case $CATALOG_MODE in 1) echo none ;; 2) echo Composio ;; 3) echo "Pipedream (${NEW[PIPEDREAM_ENVIRONMENT]})" ;; esac)"
+  [[ -z $CADDY_ROW ]] || row Caddy "$CADDY_ROW"
 
   if [[ -n ${CUR[RAKAZO_IMAGE_TAG]:-} && ${CUR[RAKAZO_IMAGE_TAG]} != "${NEW[RAKAZO_IMAGE_TAG]}" ]]; then
-    notes+=("Images change to ${NEW[RAKAZO_IMAGE_TAG]}: docker compose pull && docker compose up -d")
+    notes+=("Images change to ${NEW[RAKAZO_IMAGE_TAG]}: in $DEPLOY_DIR docker compose pull && docker compose up -d")
   fi
-  if ((PORTS_CHANGED)); then
-    notes+=("Ports changed: update them in /etc/caddy/rakazo.caddy and reload Caddy, otherwise the domain answers 502.")
+  if ((PORTS_CHANGED)) && { remote_proxy NEW || ((${#CADDY_TODO[@]})); }; then
+    notes+=("Ports changed: update the reverse proxy (next steps), otherwise the domain answers 502.")
+  fi
+  if [[ $OLD_MAIL == receive* && $m == send ]]; then
+    notes+=("Postfix no longer receives mail for $MAIL_DOMAIN: remove its MX record if nothing else uses it.")
+  fi
+  if [[ -n $OLD_MAIL && -z $m ]]; then
+    notes+=("Mail server off: in $DEPLOY_DIR docker compose rm -sf postfix stops and removes its container.")
+    notes+=("postfix/ stays with its DKIM key; remove the mail DNS records if nothing else uses them.")
   fi
   if ! on_edge; then
     for k in "${EDGE_KEYS[@]}"; do
@@ -960,46 +1540,39 @@ summary() {
   fi
 }
 
+# step TITLE – numbered heading in the next steps
+step() { STEP=$((STEP + 1)); printf '  %d. %s\n' "$STEP" "$1"; }
+
 next_steps() {
-  local caddy_ports="" caddy_sed cap scim inbound up
+  local cap scim inbound up c m=$MAIL_MODE host=${NEW[RAKAZO_HOST]}
+  STEP=0
   scim=$(edge_val SCIM_BEARER_TOKEN) inbound=$(edge_val INBOUND_EMAIL_DOMAIN)
   up=$(upstream_ip "${NEW[RAKAZO_BIND]}")
-  caddy_sed="-e 's/rakazo\\.example\\.com/${NEW[RAKAZO_HOST]}/'"
-  if [[ $up != 127.0.0.1 || ${NEW[RAKAZO_WEB_PORT]} != "$DEFAULT_WEB_PORT" ||
-    ${NEW[RAKAZO_API_PORT]} != "$DEFAULT_API_PORT" ]]; then
-    caddy_ports=" and upstreams $up:${NEW[RAKAZO_WEB_PORT]} (web), $up:${NEW[RAKAZO_API_PORT]} (API)"
-    caddy_sed+=" -e 's/127\\.0\\.0\\.1:$DEFAULT_WEB_PORT /$up:${NEW[RAKAZO_WEB_PORT]} /'"
-    caddy_sed+=" -e 's/127\\.0\\.0\\.1:$DEFAULT_API_PORT /$up:${NEW[RAKAZO_API_PORT]} /'"
-  fi
 
   section "Once per host"
-  if [[ ${NEW[RAKAZO_BIND]} != 127.0.0.1 && -n ${NEW[TRUSTED_PROXIES]} ]]; then
+  step DNS
+  printf '     Set the records under "DNS records" above, also in %s/dns-records.txt.\n' "$DEPLOY_DIR"
+  if remote_proxy NEW; then
     [[ ${NEW[RAKAZO_BIND]} != 0.0.0.0 ]] || up="<IP of this host>"
+    step "Reverse proxy (${NEW[TRUSTED_PROXIES]#local-networks,})"
     cat <<EOF
-  1. DNS
-     A/AAAA record for ${NEW[RAKAZO_HOST]} pointing to your reverse proxy.
-  2. Reverse proxy (${NEW[TRUSTED_PROXIES]#local-networks,})
      Terminates TLS for ${NEW[RAKAZO_HOST]} and forwards /health, /api/* and /rpc/* to
      $up:${NEW[RAKAZO_API_PORT]}, everything else to $up:${NEW[RAKAZO_WEB_PORT]}, with
      X-Forwarded-For set to the client. Caddy template: ${CADDY_EXAMPLE_URL}
      Allow only the proxy to reach these ports; they serve plain HTTP.
 EOF
-  else
-    cat <<EOF
-  1. DNS
-     A/AAAA record for ${NEW[RAKAZO_HOST]} pointing to this host. Open 80/tcp and 443/tcp
-     (443/udp for HTTP/3).
-  2. Caddy
-     Save Caddyfile.example as /etc/caddy/rakazo.caddy with your domain${caddy_ports}:
-       sudo curl -fsSLo /etc/caddy/rakazo.caddy ${CADDY_EXAMPLE_RAW}
-       sudo sed -i ${caddy_sed} /etc/caddy/rakazo.caddy
-     Once in /etc/caddy/Caddyfile: import /etc/caddy/rakazo.caddy, then
-       sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
-     Template: ${CADDY_EXAMPLE_URL}
-EOF
   fi
+  if [[ $m == *send ]]; then
+    step "Reverse DNS and port 25"
+    printf '     At your hoster: PTR of %s set to %s, and outbound 25/tcp allowed.\n' \
+      "${IPV4:-<public IPv4 of this host>}" "$host"
+  fi
+  if ((${#CADDY_TODO[@]})); then
+    step Caddy
+    for c in "${CADDY_TODO[@]}"; do printf '       %s\n' "$c"; done
+  fi
+  step "Docker daemon (recommended)"
   cat <<'EOF'
-  3. Docker daemon (recommended)
      Every Private bot and every space gets its own Docker network; the built-in address pools hold
      only about 30. Computers are created by the supervisor, so only the daemon rotates their logs.
      In /etc/docker/daemon.json (if it exists, add only the keys; the range must not overlap your
@@ -1013,23 +1586,23 @@ EOF
 EOF
   cap=$(pool_capacity)
   [[ -z $cap ]] || printf '     Address pools are already configured here: room for %s networks.\n' "$cap"
-  cat <<'EOF'
-  4. Computer firewall (recommended)
+  step "Computer firewall (recommended)"
+  cat <<EOF
      Keeps computers away from the host, the LAN and cloud metadata (169.254.169.254); without it
      they have open network access. Docker Engine with iptables; read the script first:
-       curl -fsSLo /tmp/restrict-computer-egress.sh \
+       curl -fsSLo /tmp/restrict-computer-egress.sh \\
          https://raw.githubusercontent.com/elie222/rakazo/main/infra/compose/restrict-computer-egress.sh
        sudo bash /tmp/restrict-computer-egress.sh
-     If the stack already runs: docker compose up -d --force-recreate supervisor
+     If the stack already runs: cd $DEPLOY_DIR && docker compose up -d --force-recreate supervisor
 EOF
 
   section Start
-  printf '  5. docker compose up -d\n'
-  printf '  6. ./generate-env.sh --check\n'
+  step "cd $DEPLOY_DIR && docker compose up -d"
+  step "$SELF --check"
   if ((SIGNUP_MODE == 1)) && [[ -z $scim ]]; then
-    printf '  7. ./generate-env.sh --owner   the admin account with a password, the only way in while signup is closed\n'
+    step "$SELF --owner   the admin account with a password, the only way in while signup is closed"
   else
-    printf '  7. ./generate-env.sh --owner   the admin account with a password\n'
+    step "$SELF --owner   the admin account with a password"
   fi
 
   if [[ -n ${NEW[OIDC_ISSUER]}$scim ]]; then
@@ -1051,39 +1624,41 @@ EOF
       fi
     fi
     if [[ -n $scim ]]; then
-      row SCIM "base URL https://${NEW[RAKAZO_HOST]}/api/auth/scim/v2, token: grep ^SCIM_BEARER_TOKEN= .env"
+      row SCIM "base URL https://${NEW[RAKAZO_HOST]}/api/auth/scim/v2, token: grep ^SCIM_BEARER_TOKEN= $DEPLOY_DIR/.env"
       row "" "(Entra ID: Enterprise application → Provisioning → Automatic, Tenant URL and Secret Token)"
     fi
   fi
 
-  if [[ -n $inbound ]]; then
+  if [[ -n $inbound && $m != receive* ]]; then
     section "Bot email"
-    printf '  Route all mail for %s to a relay (Cloudflare Email Routing or Postfix) that posts\n' "$inbound"
+    printf '  Route all mail for %s to a relay (e.g. Cloudflare Email Routing) that posts\n' "$inbound"
     printf '  each message to https://%s/api/v1/email/inbound?to=<recipient> with\n' "${NEW[RAKAZO_HOST]}"
     printf '  Authorization: Bearer <INBOUND_EMAIL_SECRET>. Guide: %s\n' "$INBOUND_EMAIL_DOCS"
   fi
 
   section Later
-  row Update "docker compose pull && docker compose up -d"
-  row "Change settings" "./generate-env.sh, then docker compose up -d"
-  row Check "./generate-env.sh --check"
+  row Update "git pull in $REPO_DIR, then $SELF"
+  row "" "and in $DEPLOY_DIR: docker compose pull && docker compose up -d"
+  row "Change settings" "$SELF, then in $DEPLOY_DIR: docker compose up -d"
+  row Check "$SELF --check"
   if on_edge; then
-    row "Lock someone out" "./generate-env.sh --deactivate EMAIL (undo with --reactivate)"
+    row "Lock someone out" "$SELF --deactivate EMAIL (undo with --reactivate)"
   fi
 }
 
 generate() {
-  local k
   command -v openssl >/dev/null || die "openssl is missing."
   [[ -t 0 ]] || die "Please run interactively in a terminal."
+  printf 'Rakazo – set up the deployment in %s\n' "$DEPLOY_DIR"
+  if legacy_install; then migrate_legacy; else enter_deploy_dir; fi
   load_env
+  load_postfix_env
   if pg_data_exists && [[ -z ${CUR[POSTGRES_PASSWORD]:-} || -z ${CUR[ENCRYPTION_KEY]:-} ]]; then
-    die "./data/postgres already holds a database, but .env lacks POSTGRES_PASSWORD or ENCRYPTION_KEY.
-New values would not match (sign-in fails, stored credentials become unreadable). Restore the old
-.env from its backup or delete ./data deliberately."
+    die "$DEPLOY_DIR/data/postgres already holds a database, but .env lacks POSTGRES_PASSWORD or
+ENCRYPTION_KEY. New values would not match (sign-in fails, stored credentials become unreadable).
+Restore the old .env from its backup or delete data/ deliberately."
   fi
 
-  printf 'Rakazo – set up .env\n'
   if [[ -f $ENV_FILE ]]; then
     printf 'Existing .env found: values in [ ] are the current ones, secrets are kept.\n'
   fi
@@ -1093,6 +1668,7 @@ New values would not match (sign-in fails, stored credentials become unreadable)
   step_domain
   step_ports
   step_computers
+  step_mail
   step_email
   step_bot_email
   step_sso
@@ -1102,10 +1678,21 @@ New values would not match (sign-in fails, stored credentials become unreadable)
   step_catalog
   step_models
   step_secrets
+  deploy_files
   write_env
+  write_postfix
   mkdir -p data/postgres data/app data/web-assets credentials
+  step_caddy
+  caddy_certs
+  detect_ips
+  { printf '# DNS records for Rakazo, written by generate-env.sh on %s\n\n' "$(date '+%Y-%m-%d %H:%M')"; dns_text; } \
+    >dns-records.txt
+  DONE+=("dns-records.txt written")
+  hand_over
 
   summary
+  section "DNS records"
+  dns_text | sed 's/^./  &/'
   next_steps
 }
 
@@ -1275,17 +1862,209 @@ check_screen() { # check_screen BASE_URL label [curl options …]
   esac
 }
 
+# Connects to SMTP_URL the way Rakazo does (nodemailer from the app image, STARTTLS required,
+# certificate verified, the same timeouts), logs in and quits without sending. Prints no secrets.
+SMTP_VERIFY_JS='const u=new URL(process.env.SMTP_URL);if(u.protocol==="smtp:")u.searchParams.set("requireTLS","true");for(const [k,v] of [["connectionTimeout",1e4],["greetingTimeout",1e4],["socketTimeout",3e4]])if(!u.searchParams.has(k))u.searchParams.set(k,String(v));require(require.resolve("nodemailer",{paths:["/app/packages/adapters"]})).createTransport(u.href).verify().then(()=>process.exit(0),e=>{console.error([e.code,e.responseCode,e.message].filter(Boolean).join(" ").replace(/\/\/[^@\s]*@/g,"//***@"));process.exit(1)})'
+
+check_deploy() {
+  local f owner files=(docker-compose.yml) differ=()
+  printf 'Deployment (%s)\n' "$DEPLOY_DIR"
+  owner=$(stat -c %U .)
+  if [[ $owner == "$(id -un)" ]]; then ok "owned by $owner"
+  else hint "owned by $owner, not $(id -un): the script and docker compose need sudo there"; fi
+  [[ $(stat -c %a .) != *[2367] ]] || bad "$DEPLOY_DIR is writable for everyone: chmod o-w $DEPLOY_DIR"
+  [[ -d data && -d credentials ]] || hint "data/ or credentials/ is missing: docker compose creates it owned by root"
+  [[ ! $REPO_DIR -ef . ]] || return 0
+  [[ -z $OLD_MAIL ]] || files+=(postfix/rakazo.sh postfix/rakazo-inbound-email)
+  for f in "${files[@]}"; do
+    if [[ ! -f $f ]]; then bad "$f is missing: $SELF copies it"
+    elif ! cmp -s "$REPO_DIR/$f" "$f"; then differ+=("$f"); fi
+  done
+  if ((${#differ[@]})); then
+    hint "differs from the checkout: ${differ[*]}; $SELF copies the new version (a changed copy is backed up)"
+  else
+    ok "${files[*]} match the checkout"
+  fi
+  [[ ! -f $REPO_DIR/$ENV_FILE ]] || hint "$REPO_DIR/.env is left from the old layout and unused"
+  for f in "$REPO_DIR"/migrated-*; do
+    if [[ -d $f ]]; then hint "$f holds the files of the old layout: delete it once this install works"; fi
+  done
+}
+
+check_caddy() {
+  local f=$CADDY_FILE web=$1 api=$2 host=${CUR[RAKAZO_HOST]:-}
+  printf '\nCaddy\n'
+  if remote_proxy CUR; then
+    hint "reverse proxy on another machine (${CUR[TRUSTED_PROXIES]#local-networks,}): checked through https://$host below"
+    return 0
+  elif [[ ! -r $f ]]; then
+    hint "$f not found or not readable: $SELF writes it"
+    return 0
+  fi
+  if [[ $(<"$f") == "$(render_caddy CUR)" ]]; then ok "$f is what $SELF writes"
+  else hint "$f differs from what $SELF writes (template, .env or changes here): it shows the diff"; fi
+  if ! grep -qF "$host {" "$f"; then
+    bad "$f has no site block for $host: $SELF writes it, then reload Caddy"
+  elif grep -q "reverse_proxy $web " "$f" && grep -q "reverse_proxy $api " "$f"; then
+    ok "$f serves $host and points to $web and $api"
+  else
+    bad "$f does not point to $web/$api: $SELF fixes the upstreams, then reload Caddy"
+  fi
+}
+
+# Sends a test mail from inside the Postfix container to an unclaimed name; Rakazo accepts and
+# drops it. It must leave the queue as sent.
+check_inbound_mail() {
+  local rcpt res line i
+  rcpt=check-$(openssl rand -hex 6)@$MAIL_DOMAIN
+  if ! printf 'From: <postmaster@%s>\nTo: <%s>\nSubject: generate-env.sh --check\nMessage-ID: <%s.%s@%s>\n\n%s\n' \
+    "$MAIL_DOMAIN" "$rcpt" "${rcpt%@*}" "$STAMP" "$1" "Test of generate-env.sh --check; nobody has this address." |
+    docker compose exec -T postfix sendmail -f '<>' "$rcpt" >/dev/null 2>&1; then
+    bad "inbound: sendmail in the postfix container fails (docker compose logs postfix)"
+    return
+  fi
+  for ((i = 0; i < 30; i++)); do
+    res=$(docker compose exec -T postfix postqueue -p 2>/dev/null || true)
+    [[ $res == *"$rcpt"* ]] || break
+    sleep 1
+  done
+  if [[ $res == *"$rcpt"* ]]; then
+    line=$(grep -B 1 -F "$rcpt" <<<"$res" | grep -o '(.*)' | head -n 1 || true)
+    bad "inbound: a test mail to $rcpt is still queued ${line:-(docker compose logs postfix)}"
+    return
+  fi
+  line=$(docker compose logs --no-log-prefix --since 10m postfix 2>/dev/null | grep -F "to=<$rcpt>" | tail -n 1 || true)
+  case $line in
+    *status=sent*) ok "inbound: Postfix took a test mail for $rcpt and handed it to Rakazo" ;;
+    *status=*) bad "inbound: test mail to $rcpt: ${line#*status=}" ;;
+    *) ok "inbound: a test mail for $rcpt left the queue (no delivery line in the logs)" ;;
+  esac
+}
+
+# check_mail RUNNING – the mail settings and, with the stack running, certificate, a test mail and
+# a login as Rakazo sends
+check_mail() {
+  local m=$OLD_MAIL host=${CUR[RAKAZO_HOST]:-} pw=${PF[SMTPD_SASL_USERS]:-} state errors=$ERRORS res uid end
+  [[ ,${CUR[COMPOSE_PROFILES]:-}, == *,mail,* ]] || return 0
+  printf '\nMail server (%s)\n' "$host"
+  if [[ -z $m ]]; then
+    bad "COMPOSE_PROFILES=mail, but postfix/postfix.env is missing or neither receives nor sends: $SELF"
+    return 0
+  fi
+  [[ $m != receive* || ${CUR[RAKAZO_IMAGE_TAG]:-} == edge ]] || bad "receiving bot email needs edge"
+  caddy_packaged || bad "Caddy is not the packaged service with its data in /var/lib/caddy: Postfix finds no certificate"
+  [[ $(stat -c %a postfix/postfix.env) == 600 ]] || bad "postfix/postfix.env is not mode 600: chmod 600 postfix/postfix.env"
+  [[ ${PF[POSTFIX_myhostname]:-} == "$host" ]] || bad "postfix/postfix.env is not for $host: $SELF"
+  valid_host "$MAIL_DOMAIN" || bad "postfix/postfix.env has no valid ALLOWED_SENDER_DOMAINS: $SELF"
+  if [[ $m == receive* ]]; then
+    [[ ${CUR[INBOUND_EMAIL_DOMAIN]:-} == "$MAIL_DOMAIN" ]] ||
+      bad "INBOUND_EMAIL_DOMAIN is not the mail domain $MAIL_DOMAIN: $SELF"
+    [[ ${PF[INBOUND_SECRET]:-} == "${CUR[INBOUND_EMAIL_SECRET]:-}" ]] ||
+      bad "INBOUND_SECRET in postfix/postfix.env differs from INBOUND_EMAIL_SECRET: Rakazo would answer 401"
+  fi
+  if [[ $m == *send ]]; then
+    [[ ${CUR[EMAIL_PROVIDER]:-} == smtp &&
+      ${CUR[SMTP_URL]:-} == "smtp://rakazo%40$host:${pw#*:}@postfix:587/?tls.servername=$host" ]] ||
+      bad "SMTP_URL does not point to the SASL user of postfix/postfix.env: $SELF"
+    [[ ${CUR[EMAIL_FROM]:-} =~ @([^@[:space:]\>]+) && ${BASH_REMATCH[1],,} == "$MAIL_DOMAIN" ]] ||
+      bad "EMAIL_FROM is not an address @$MAIL_DOMAIN: Postfix rejects it"
+    openssl pkey -in "postfix/dkim/$MAIL_DOMAIN.private" -noout 2>/dev/null ||
+      bad "postfix/dkim/$MAIL_DOMAIN.private is missing or no key: $SELF creates it"
+  fi
+  ((ERRORS > errors)) || ok "postfix/postfix.env and .env match"
+
+  [[ -n $1 ]] || return 0
+  state=$(docker compose ps --format '{{if .Health}}{{.Health}}{{else}}{{.State}}{{end}}' postfix 2>/dev/null || true)
+  case $state in
+    healthy | running | starting) ;;
+    "") bad "the postfix container is not running (docker compose up -d; docker compose logs postfix)"; return 0 ;;
+    *) hint "postfix is $state: mail tests skipped (docker compose logs postfix)"; return 0 ;;
+  esac
+  uid=$(docker compose exec -T postfix stat -c %u /tls 2>/dev/null | tr -d '\r' || true)
+  [[ $uid != 0 ]] ||
+    bad "$CADDY_CERTS belongs to root, so Caddy cannot store certificates: sudo chown caddy:caddy $CADDY_CERTS"
+  res=$(docker compose exec -T postfix cat "${PF[POSTFIX_smtpd_tls_cert_file]:-}" 2>/dev/null || true)
+  if ! openssl x509 -noout -checkhost "$host" <<<"$res" 2>/dev/null | grep -q 'does match'; then
+    bad "Postfix sees no certificate for $host at ${PF[POSTFIX_smtpd_tls_cert_file]:-?} (Caddy: sudo journalctl -u caddy)"
+  else
+    end=$(openssl x509 -noout -enddate <<<"$res" | cut -d= -f2)
+    ok "Postfix sees the certificate for $host, valid until $end"
+  fi
+  [[ $m != receive* ]] || check_inbound_mail "$host"
+  [[ $m == *send ]] || return 0
+  if res=$(docker compose exec -T api node -e "$SMTP_VERIFY_JS" 2>&1); then
+    ok "submission: the API logs in to postfix:587 with STARTTLS and the certificate of $host, as Rakazo sends"
+  else
+    bad "submission: the API cannot log in with SMTP_URL: $(tail -n 1 <<<"$res")"
+  fi
+  if timeout 5 bash -c 'exec 3<>/dev/tcp/gmail-smtp-in.l.google.com/25' 2>/dev/null; then
+    hint "outbound port 25 is open (gmail-smtp-in.l.google.com answers)"
+  else
+    hint "outbound port 25 seems blocked: mail to other servers stays queued; ask your hoster to open it"
+  fi
+}
+
+# Joins the strings of each TXT record dig prints into one value per line.
+txt_join() { sed -e 's/" "//g' -e 's/^"//' -e 's/"$//'; }
+
+# Compares each record of dns_records with what the resolver answers.
+check_dns() {
+  local name type prio value got want mh=${CUR[RAKAZO_HOST]:-}
+  printf '\nDNS\n'
+  if ! command -v dig >/dev/null; then
+    hint "dig is not installed (dnsutils or bind-utils): the records are not compared"
+    return 0
+  fi
+  detect_ips
+  while IFS='|' read -r name type prio value; do
+    case $type in
+      A | AAAA)
+        want='^[0-9.]+$'
+        [[ $type == A ]] || want='^[0-9a-fA-F:]*:[0-9a-fA-F:]*$'
+        got=$(dig +short "$type" "$name" 2>/dev/null | grep -E "$want" | sort | paste -sd ' ' - || true)
+        if [[ -z $got ]]; then bad "$type $name: no record"
+        elif [[ $value == \<* || " $got " == *" $value "* ]]; then ok "$type $name → $got"
+        else hint "$type $name → $got, not this host's $value (fine only behind a proxy or CDN)"; fi
+        ;;
+      MX)
+        got=$(dig +short MX "$name" 2>/dev/null | awk '{print tolower($2)}' | sed 's/\.$//' || true)
+        if grep -qxF "$value" <<<"$got"; then ok "MX $name → $value"
+        else bad "MX $name → ${got:-none}, expected $prio $value"; fi
+        ;;
+      TXT)
+        want=${value%%[; ]*}
+        got=$(dig +short TXT "$name" 2>/dev/null | txt_join | grep -F "$want" || true)
+        if [[ -z $got ]]; then bad "TXT $name: no $want record"
+        elif (($(wc -l <<<"$got") > 1)); then bad "TXT $name: more than one $want record"
+        elif [[ ${got//[[:space:]]/} == "${value//[[:space:]]/}" ]]; then ok "TXT $name: $want as expected"
+        elif [[ $want == v=DKIM1 ]]; then bad "TXT $name: another key than postfix/dkim/rakazo.private"
+        elif [[ $want == v=spf1 && ($got == *"$mh"* || (-n $IPV4 && $got == *"$IPV4"*)) ]]; then
+          ok "TXT $name: SPF includes this host ($got)"
+        elif [[ $want == v=spf1 ]]; then bad "TXT $name: SPF \"$got\" does not allow $mh"
+        else hint "TXT $name is \"$got\", suggested \"$value\""; fi
+        ;;
+    esac
+  done < <(dns_records CUR "$OLD_MAIL")
+  if [[ $OLD_MAIL == *send && -n $IPV4 ]]; then
+    got=$(dig +short -x "$IPV4" 2>/dev/null | sed 's/\.$//' | head -n 1 || true)
+    if [[ $got == "$mh" ]]; then ok "PTR $IPV4 → $mh"
+    else bad "PTR $IPV4 → ${got:-none}, expected $mh (set it at your hoster)"; fi
+  fi
+}
+
 check() {
-  local k v host origin code res pw app_pw e running web api up caddy_file img cap key_env
-  [[ -f $ENV_FILE ]] || die "No .env found. Run ./generate-env.sh first."
+  local k v host origin code res pw app_pw e running="" web api up img cap key_env
+  [[ -f $ENV_FILE ]] || die "No .env found. Run $SELF first."
   load_env
+  load_postfix_env
   host=${CUR[RAKAZO_HOST]:-}
   origin=https://$host
   up=$(upstream_ip "${CUR[RAKAZO_BIND]:-127.0.0.1}")
   web=$up:${CUR[RAKAZO_WEB_PORT]:-}
   api=$up:${CUR[RAKAZO_API_PORT]:-}
 
-  printf '.env\n'
+  check_deploy
+  printf '\n.env\n'
   [[ $(stat -c %a "$ENV_FILE" 2>/dev/null || echo 600) == 600 ]] ||
     hint ".env is not mode 600: chmod 600 .env"
   for k in RAKAZO_HOST WEB_ORIGIN BETTER_AUTH_URL API_URL RAKAZO_BIND RAKAZO_WEB_PORT RAKAZO_API_PORT \
@@ -1453,7 +2232,10 @@ check() {
     fi
   fi
 
-  if [[ -n ${running:-} ]]; then
+  check_caddy "$web" "$api"
+  check_mail "$running"
+
+  if [[ -n $running ]]; then
     command -v curl >/dev/null || die "curl is missing for the runtime checks."
     printf '\nLocal (%s)\n' "$up"
     res=$(http_probe "http://$api/health")
@@ -1508,22 +2290,6 @@ check() {
     if ((${#LIST[@]} == 0)); then
       v=$(docker compose exec -T postgres psql -U rakazo -d rakazo -tAqc 'SELECT count(*) FROM "user"' 2>/dev/null || true)
       [[ $v == 0 ]] && hint "no accounts yet: ./generate-env.sh --owner" || hint "no RAKAZO_ADMIN_EMAILS set"
-    fi
-
-    printf '\nCaddy\n'
-    caddy_file=/etc/caddy/rakazo.caddy
-    if [[ ${CUR[RAKAZO_BIND]:-127.0.0.1} != 127.0.0.1 && -n ${CUR[TRUSTED_PROXIES]:-} && ! -r $caddy_file ]]; then
-      hint "reverse proxy on another machine (${CUR[TRUSTED_PROXIES]#local-networks,}): checked through $origin below"
-    elif [[ ! -r $caddy_file ]]; then
-      hint "$caddy_file not found: get Caddyfile.example from $CADDY_EXAMPLE_URL"
-    elif grep -qF rakazo.example.com "$caddy_file"; then
-      bad "$caddy_file still contains rakazo.example.com: replace it with $host, reload Caddy"
-    elif ! grep -qF "$host {" "$caddy_file"; then
-      bad "$caddy_file has no site block for $host: replace the domain there, reload Caddy"
-    elif grep -q "reverse_proxy $web " "$caddy_file" && grep -q "reverse_proxy $api " "$caddy_file"; then
-      ok "$caddy_file serves $host and points to $web and $api"
-    else
-      bad "$caddy_file does not point to $web/$api: fix the reverse_proxy ports there, reload Caddy"
     fi
 
     printf '\nComputers\n'
@@ -1589,6 +2355,7 @@ check() {
       fi
     fi
   fi
+  check_dns
 
   printf '\n'
   if ((ERRORS)); then
@@ -1599,14 +2366,30 @@ check() {
   printf 'All good.\n'
 }
 
-usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
-case ${1-} in
+ACTION="" ACCOUNT=""
+while (($#)); do
+  case $1 in
+    --dir) (($# > 1)) || die "--dir needs a directory."; DEPLOY_DIR=$2; shift ;;
+    --dir=*) DEPLOY_DIR=${1#*=} ;;
+    --owner | --check | -h | --help) ACTION=$1 ;;
+    --deactivate | --reactivate) ACTION=$1 ACCOUNT=${2-}; (($# == 1)) || shift ;;
+    *) die "Unknown option: $1 (see --help)" ;;
+  esac
+  shift
+done
+[[ -n $DEPLOY_DIR ]] || die "--dir needs a directory."
+DEPLOY_DIR=$(realpath -m -- "$DEPLOY_DIR")
+[[ $DEPLOY_DIR == /opt/rakazo ]] || DIR_OPT=" --dir $DEPLOY_DIR"
+# How to call this script again, as printed in hints and next steps.
+SELF=${REPO_DIR/#"${HOME:-/nonexistent}"/\~}/generate-env.sh$DIR_OPT
+
+case $ACTION in
   "") generate ;;
-  --owner) owner ;;
-  --check) check ;;
-  --deactivate) account_status deactivate "${2-}" ;;
-  --reactivate) account_status reactivate "${2-}" ;;
+  --owner) use_deploy_dir; owner ;;
+  --check) use_deploy_dir; check ;;
+  --deactivate) use_deploy_dir; account_status deactivate "$ACCOUNT" ;;
+  --reactivate) use_deploy_dir; account_status reactivate "$ACCOUNT" ;;
   -h | --help) usage ;;
-  *) die "Unknown option: $1 (see --help)" ;;
 esac

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(</etc/rakazo/inbound-email-secret)") \
+  -H 'Content-Type: message/rfc822' --data-binary @- --url-query "to=$1" \
+  http://api:3100/api/v1/email/inbound) || exit 75
+case $status in
+  2??) exit 0 ;;
+  413) exit 69 ;;
+  *) exit 75 ;;
+esac

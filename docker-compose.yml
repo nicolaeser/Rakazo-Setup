@@ -222,3 +222,23 @@ services:
         condition: service_completed_successfully
       api:
         condition: service_healthy
+
+  postfix:
+    image: boky/postfix:5.2.1
+    profiles:
+      - mail
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
+    env_file:
+      - postfix/postfix.env
+    volumes:
+      - /var/lib/caddy/.local/share/caddy/certificates:/tls:ro
+      - ./postfix/dkim:/etc/opendkim/keys:ro
+      - ./postfix:/docker-init.d:ro
+      - ./data/postfix:/var/spool/postfix
+    ports:
+      - "0.0.0.0:25:25"

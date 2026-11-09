@@ -2,3 +2,8 @@
 .env.bak.*
 data/
 credentials/
+migrated-*/
+postfix/postfix.env
+postfix/dkim/
+*.new
+dns-records.txt
