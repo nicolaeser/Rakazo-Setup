@@ -171,6 +171,16 @@ pg_data_exists() {
   [[ -n $(ls -A data/postgres) ]]
 }
 
+# Networks Docker's configured address pools hold; empty while its built-in pools (about 30) apply.
+pool_capacity() {
+  local pools base size n=0
+  pools=$(docker info --format '{{json .DefaultAddressPools}}' 2>/dev/null) || return 0
+  while IFS=, read -r base size; do
+    ((size >= ${base##*/})) && n=$((n + 2 ** (size - ${base##*/})))
+  done < <(sed -n 's/"Base":"\([^"]*\)","Size":\([0-9]*\)/\n\1,\2\n/gp' <<<"$pools" | grep -E '^[0-9.]+/[0-9]+,[0-9]+$')
+  ((n == 0)) || printf '%s' "$n"
+}
+
 keep_or_new() { if [[ -n $1 ]]; then printf '%s' "$1"; else openssl rand -hex "$2"; fi; }
 
 step_domain() {
@@ -551,7 +561,7 @@ EOF
 }
 
 generate() {
-  local k caddy_note caddy_sed
+  local k caddy_note caddy_sed cap
   command -v openssl >/dev/null || die "openssl is missing."
   [[ -t 0 ]] || die "Please run interactively in a terminal."
   load_env
@@ -614,20 +624,35 @@ Next steps
        sudo sed -i ${caddy_sed} /etc/caddy/rakazo.caddy
        once in /etc/caddy/Caddyfile:  import /etc/caddy/rakazo.caddy
        sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
-  3. Recommended, once per host: keep computers away from the host, the LAN and cloud metadata
+EOF
+  cap=$(pool_capacity)
+  if [[ -n $cap ]]; then
+    printf '  3. Docker address pools are configured: room for %s networks.\n' "$cap"
+  else
+    cat <<'EOF'
+  3. Recommended, once per host, for more than about 20 computers: every Private bot and every
+     space gets its own computer with its own Docker network, and Docker's built-in address pools
+     hold only about 30 networks. In /etc/docker/daemon.json (if the file exists add only the key;
+     the range must not overlap your LAN, VPN or cloud network, see ip route):
+       { "default-address-pools": [{ "base": "10.200.0.0/16", "size": 24 }] }
+       sudo dockerd --validate --config-file /etc/docker/daemon.json && sudo systemctl restart docker
+EOF
+  fi
+  cat <<EOF
+  4. Recommended, once per host: keep computers away from the host, the LAN and cloud metadata
      (169.254.169.254). Without these firewall rules computers have open network access. Linux with
      Docker Engine and iptables; read the script first:
        curl -fsSLo /tmp/restrict-computer-egress.sh \\
          https://raw.githubusercontent.com/elie222/rakazo/main/infra/compose/restrict-computer-egress.sh
        sudo bash /tmp/restrict-computer-egress.sh
      If the stack is already running: docker compose up -d --force-recreate supervisor
-  4. Start the stack:  docker compose up -d
-  5. Check:            ./generate-env.sh --check
+  5. Start the stack:  docker compose up -d
+  6. Check:            ./generate-env.sh --check
 EOF
   if ((SIGNUP_MODE == 1)); then
-    printf '  6. Create the first account with a password, the only way in while signup is closed:\n'
+    printf '  7. Create the first account with a password, the only way in while signup is closed:\n'
   else
-    printf '  6. Create the admin account with a password:\n'
+    printf '  7. Create the admin account with a password:\n'
   fi
   printf '       ./generate-env.sh --owner\n'
   if [[ -n ${NEW[OIDC_ISSUER]} ]]; then
@@ -757,7 +782,7 @@ check_screen() { # check_screen BASE_URL label [curl options …]
 }
 
 check() {
-  local k v host origin code res pw app_pw e running web api caddy_file img
+  local k v host origin code res pw app_pw e running web api caddy_file img cap
   [[ -f $ENV_FILE ]] || die "No .env found. Run ./generate-env.sh first."
   load_env
   host=${CUR[RAKAZO_HOST]:-}
@@ -961,10 +986,15 @@ check() {
     k=$(docker ps -q --filter label=rakazo.managed=true 2>/dev/null | wc -l || true)
     v=$(docker network ls -q --filter label=rakazo.botId 2>/dev/null | wc -l || true)
     ok "$k computers running, $v computer networks created"
-    if ((v >= 20)); then
-      hint "every computer network takes a subnet from Docker's address pools; the defaults allow a few"
-      hint "dozen. Once they run out, no new computers start: extend default-address-pools in"
-      hint "/etc/docker/daemon.json."
+    cap=$(pool_capacity)
+    e=$(docker network ls -q --filter driver=bridge 2>/dev/null | wc -l || true)
+    if [[ -z $cap ]]; then
+      hint "Docker's built-in address pools hold about 30 networks and every computer needs one ($e in use)."
+      hint "For more computers set default-address-pools (step 3 of ./generate-env.sh)."
+    elif ((e * 10 >= cap * 8)); then
+      bad "Docker address pools nearly full: $e of $cap networks; extend default-address-pools"
+    else
+      ok "Docker address pools: $e of $cap networks in use"
     fi
 
     printf '\nPublic (%s)\n' "$origin"
