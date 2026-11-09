@@ -135,7 +135,7 @@ services:
       - ./data/app:/data
       - ./credentials:/credentials:ro
     ports:
-      - "127.0.0.1:${RAKAZO_API_PORT:?}:3100"
+      - "${RAKAZO_BIND:?}:${RAKAZO_API_PORT:?}:3100"
     depends_on:
       postgres:
         condition: service_healthy
@@ -216,7 +216,7 @@ services:
     volumes:
       - ./data/web-assets:/app/apps/web/asset-archive
     ports:
-      - "127.0.0.1:${RAKAZO_WEB_PORT:?}:5173"
+      - "${RAKAZO_BIND:?}:${RAKAZO_WEB_PORT:?}:5173"
     depends_on:
       data-init:
         condition: service_completed_successfully

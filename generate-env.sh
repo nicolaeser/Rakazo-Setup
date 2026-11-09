@@ -6,6 +6,10 @@
 #   ./generate-env.sh --owner   Create the admin account with a password (stack must be running)
 #   ./generate-env.sh --check   Check .env; with the stack running also health, host check,
 #                               accounts, computers, screen proxy, Caddy, TLS and CORS
+#   ./generate-env.sh --deactivate EMAIL
+#                               Lock an account: ends its sign-ins, computers and runs (edge)
+#   ./generate-env.sh --reactivate EMAIL
+#                               Unlock it again (edge)
 #
 # .env holds secrets, domain, ports and options. Everything else is fixed in docker-compose.yml
 # and takes precedence there.
@@ -20,11 +24,12 @@ DEFAULT_WEB_PORT=5173
 DEFAULT_API_PORT=3100
 CADDY_EXAMPLE_URL=https://github.com/nicolaeser/Rakazo-Setup/blob/main/Caddyfile.example
 CADDY_EXAMPLE_RAW=https://raw.githubusercontent.com/nicolaeser/Rakazo-Setup/main/Caddyfile.example
+INBOUND_EMAIL_DOCS=https://github.com/elie222/rakazo/blob/main/docs/self-host-inbound-email.md
 
 # Managed by this script.
 MANAGED_KEYS=(
   RAKAZO_HOST WEB_ORIGIN BETTER_AUTH_URL API_URL
-  RAKAZO_WEB_PORT RAKAZO_API_PORT SANDBOX_IDLE_MS
+  RAKAZO_BIND RAKAZO_WEB_PORT RAKAZO_API_PORT TRUSTED_PROXIES SANDBOX_IDLE_MS
   POSTGRES_PASSWORD DATABASE_URL DATABASE_MIGRATION_URL
   BETTER_AUTH_SECRET ENCRYPTION_KEY SCREEN_PROXY_SECRET SANDBOX_SUPERVISOR_TOKEN
   SIGNUPS_ENABLED SIGNUP_ALLOWLIST RAKAZO_ADMIN_EMAILS
@@ -33,8 +38,13 @@ MANAGED_KEYS=(
   COMPOSIO_API_KEY PIPEDREAM_CLIENT_ID PIPEDREAM_CLIENT_SECRET PIPEDREAM_PROJECT_ID PIPEDREAM_ENVIRONMENT
   PI_DEFAULT_PROVIDER PI_DEFAULT_MODEL PI_DEFAULT_CREDENTIALS OPENROUTER_API_KEY ANTHROPIC_API_KEY
   DEEPSEEK_API_KEY RAKAZO_LOCAL_MODELS_URL RAKAZO_LOCAL_MODELS RAKAZO_LOCAL_VISION_MODELS
-  RAKAZO_LOCAL_CONTEXT_WINDOW RAKAZO_LOCAL_MAX_TOKENS RAKAZO_IMAGE_TAG
+  RAKAZO_LOCAL_CONTEXT_WINDOW RAKAZO_LOCAL_MAX_TOKENS RAKAZO_LOCAL_MODELS_API_KEY RAKAZO_IMAGE_TAG
+  SCIM_BEARER_TOKEN INBOUND_EMAIL_DOMAIN INBOUND_EMAIL_SECRET
 )
+# Read only by edge until the release after v0.8.0.
+EDGE_KEYS=(SCIM_BEARER_TOKEN INBOUND_EMAIL_DOMAIN INBOUND_EMAIL_SECRET)
+# Proposed upstream, not in any image yet: https://github.com/elie222/rakazo/pull/4071
+LOCAL_KEY_PR=elie222/rakazo#4071
 # No effect in .env: fixed in docker-compose.yml or left over from the upstream setup.
 FIXED_KEYS=(
   NODE_ENV DATA_DIR WAKEUP_DRIVER AGENT_RUNTIME SANDBOX_PROVIDER SANDBOX_SUPERVISOR_URL
@@ -51,6 +61,8 @@ declare -A NEW=()  # values to write
 CUSTOM_LINES=()    # custom entries, copied unchanged
 DROPPED_KEYS=()
 PORTS_CHANGED=0
+MODELS=""          # model IDs from the last fetch_models
+BACKUP=""          # backup of the previous .env
 
 die()  { printf '\nError: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'Warning: %s\n' "$*" >&2; }
@@ -144,8 +156,17 @@ valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 port_taken() {
   command -v ss >/dev/null || return 1
   [[ -n $(ss -Hltn "sport = :$1" 2>/dev/null) ]] || return 1
-  [[ $(docker compose port "$2" "$3" 2>/dev/null) != "127.0.0.1:$1" ]]
+  [[ $(docker compose port "$2" "$3" 2>/dev/null) != *":$1" ]]
 }
+
+valid_ipv4() {
+  local IFS=. o
+  [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  for o in $1; do ((10#$o <= 255)) || return 1; done
+}
+
+# Address Caddy on this host uses to reach web and API: loopback unless they listen on one address.
+upstream_ip() { if [[ $1 == 0.0.0.0 ]]; then printf 127.0.0.1; else printf '%s' "$1"; fi; }
 
 valid_email() { [[ $1 =~ ^[^@[:space:]]+@[a-z0-9.-]+\.[a-z]{2,}$ ]]; }
 
@@ -203,10 +224,15 @@ deployment_model() {
 
 keep_or_new() { if [[ -n $1 ]]; then printf '%s' "$1"; else openssl rand -hex "$2"; fi; }
 
+on_edge() { [[ ${NEW[RAKAZO_IMAGE_TAG]:-} == edge ]]; }
+
+# edge_val KEY – the new value of an edge-only key, empty when the images are not edge
+edge_val() { if on_edge; then printf '%s' "${NEW[$1]}"; fi; }
+
 step_domain() {
   local domain old=${CUR[RAKAZO_HOST]:-}
   printf '\n== Domain ==\n'
-  printf 'Caddy on the host terminates TLS and forwards to 127.0.0.1. All origins are derived from\n'
+  printf 'Caddy terminates TLS and forwards to web and API. All origins are derived from\n'
   printf 'this one domain so that sign-in, CORS and cookies match.\n'
   [[ $old == localhost ]] && old=""
   while :; do
@@ -227,9 +253,48 @@ step_domain() {
 }
 
 step_ports() {
-  local web api old_web=${CUR[RAKAZO_WEB_PORT]:-} old_api=${CUR[RAKAZO_API_PORT]:-}
+  local web api mode def=1 bind proxy old_proxy old_web=${CUR[RAKAZO_WEB_PORT]:-} old_api=${CUR[RAKAZO_API_PORT]:-}
+  local old_bind=${CUR[RAKAZO_BIND]:-${CUR[RAKAZO_WEB_BIND]:-127.0.0.1}}
   printf '\n== Ports ==\n'
-  printf 'Web and API listen on 127.0.0.1 only; Caddy on the host forwards to them.\n'
+  printf 'Where web and API listen. Caddy on this host reaches them on 127.0.0.1; any other address\n'
+  printf 'serves them without TLS, and Docker publishes it past host firewalls such as ufw.\n'
+  [[ $old_bind == 0.0.0.0 ]] && def=2
+  [[ $old_bind == 127.0.0.1 || $old_bind == 0.0.0.0 ]] || def=3
+  choose mode "$def" \
+    "127.0.0.1 – only this host; Caddy here forwards to it (recommended)" \
+    "0.0.0.0 – every network of this host, e.g. for a reverse proxy on another machine" \
+    "one address of this host, e.g. its LAN or VPN IP for a reverse proxy on another machine"
+  case $mode in
+    1) bind=127.0.0.1 ;;
+    2) bind=0.0.0.0 ;;
+    3)
+      [[ $old_bind == 127.0.0.1 || $old_bind == 0.0.0.0 ]] && old_bind=""
+      while :; do
+        ask bind "IPv4 address of this host" "$old_bind"
+        valid_ipv4 "$bind" || { warn "\"$bind\" is not an IPv4 address."; continue; }
+        if command -v ip >/dev/null && ! ip -4 -o addr show | grep -qF " $bind/"; then
+          warn "This host has no address $bind; Docker cannot publish the ports there."
+          ask_yn "Use it anyway" n || continue
+        fi
+        break
+      done
+      ;;
+  esac
+  NEW[RAKAZO_BIND]=$bind NEW[TRUSTED_PROXIES]=${CUR[TRUSTED_PROXIES]:-}
+  # A proxy entry this script wrote goes with the remote proxy; hand-written values stay.
+  [[ $bind != 127.0.0.1 || ${NEW[TRUSTED_PROXIES]} != local-networks,* ]] || NEW[TRUSTED_PROXIES]=""
+  if [[ $bind != 127.0.0.1 ]]; then
+    printf 'A reverse proxy on another machine reaches the API from its own address. The API believes\n'
+    printf 'its X-Forwarded-For only if that address is trusted; otherwise every user shares one sign-in\n'
+    printf 'rate limit.\n'
+    old_proxy=${NEW[TRUSTED_PROXIES]#local-networks,}
+    while :; do
+      ask proxy "IP or CIDR of the reverse proxy (empty = Caddy runs on this host)" "$old_proxy"
+      if [[ -z $proxy ]] || { [[ $proxy =~ ^[0-9.]+(/[0-9]{1,2})?$ ]] && valid_ipv4 "${proxy%/*}"; }; then break; fi
+      warn "\"$proxy\" is not an IPv4 address or CIDR range."
+    done
+    NEW[TRUSTED_PROXIES]=${proxy:+local-networks,$proxy}
+  fi
   while :; do
     ask web "Port for the web frontend" "${old_web:-$DEFAULT_WEB_PORT}"
     valid_port "$web" || { warn "\"$web\" is not a port (1–65535)."; continue; }
@@ -260,7 +325,8 @@ step_images() {
   local opts=("latest – the newest release (recommended)" "edge – the current development state of main, untested")
   printf '\n== Release channel ==\n'
   printf 'edge gets every change first. Database migrations cannot be undone: going back from edge to\n'
-  printf 'latest is only safe once a release has caught up with the edge you ran.\n'
+  printf 'latest is only safe once a release has caught up with the edge you ran. Only edge offers so far:\n'
+  printf 'SCIM provisioning, bot email addresses and --deactivate.\n'
   [[ $old == edge ]] && def=2
   if [[ -n $old && $old != latest && $old != edge ]]; then
     opts+=("keep $old")
@@ -325,8 +391,34 @@ step_email() {
   NEW[EMAIL_FROM]=$from
 }
 
+step_bot_email() {
+  local def=n domain
+  NEW[INBOUND_EMAIL_DOMAIN]=${CUR[INBOUND_EMAIL_DOMAIN]:-} NEW[INBOUND_EMAIL_SECRET]=${CUR[INBOUND_EMAIL_SECRET]:-}
+  on_edge || return 0
+  printf '\n== Bot email addresses (edge, optional) ==\n'
+  printf 'Each bot can get name@<mail domain>: mail to it lands in its inbox (e.g. sign-up codes) and can\n'
+  printf 'start routines. Needs a domain that receives mail for every name and a relay that posts each\n'
+  printf 'message to Rakazo (Cloudflare Email Routing or Postfix). Bots send through the email above;\n'
+  printf 'the provider must be allowed to send as that domain.\n'
+  [[ -n ${NEW[INBOUND_EMAIL_DOMAIN]} ]] && def=y
+  if ! ask_yn "Give bots email addresses" "$def"; then
+    NEW[INBOUND_EMAIL_DOMAIN]="" NEW[INBOUND_EMAIL_SECRET]=""
+    return 0
+  fi
+  while :; do
+    ask domain "Mail domain used for nothing else (e.g. bots.example.com)" "${NEW[INBOUND_EMAIL_DOMAIN]}"
+    domain=$(normalize_host "${domain#@}")
+    valid_host "$domain" && break
+    warn "\"$domain\" is not a valid domain name."
+  done
+  NEW[INBOUND_EMAIL_DOMAIN]=$domain
+  NEW[INBOUND_EMAIL_SECRET]=$(keep_or_new "${NEW[INBOUND_EMAIL_SECRET]}" 32)
+}
+
 step_signups() {
   local mode def list e entries=() first example=@company.com
+  local closed="closed – nobody can sign up, not even with SSO; accounts only via --owner"
+  [[ -z $(edge_val SCIM_BEARER_TOKEN) ]] || closed+=" and SCIM"
   printf '\n== Signup ==\n'
   printf 'Who may create an account on their own. There is no "closed except one domain": to admit only\n'
   printf '@company.com, signup stays on with an allowlist. Admin accounts are created with a password\n'
@@ -338,7 +430,7 @@ step_signups() {
   else def=1; fi
   while :; do
     choose mode "$def" \
-      "closed – nobody can sign up, not even with SSO; accounts only via --owner" \
+      "$closed" \
       "allowlist – only listed addresses or domains, via SSO or verification mail (needs one of them)" \
       "open – anyone who reaches the domain can create an account"
     if ((mode == 2)) && [[ -z ${NEW[EMAIL_PROVIDER]}${NEW[OIDC_ISSUER]} ]]; then
@@ -443,6 +535,31 @@ step_sso() {
   fi
 }
 
+step_directory() {
+  local def=n
+  NEW[SCIM_BEARER_TOKEN]=${CUR[SCIM_BEARER_TOKEN]:-}
+  on_edge || return 0
+  printf '\n== Directory provisioning via SCIM (edge, optional) ==\n'
+  printf 'Your identity provider creates and locks accounts, also while signup is closed: then exactly\n'
+  printf 'the people assigned there get in, and removing someone ends all their sessions at once. A new\n'
+  printf 'account takes over its SSO login only with email_verified=true, otherwise it signs in with a\n'
+  printf 'code by email.\n'
+  [[ -n ${NEW[SCIM_BEARER_TOKEN]} ]] && def=y
+  if ! ask_yn "Set up SCIM" "$def"; then
+    NEW[SCIM_BEARER_TOKEN]=""
+    return 0
+  fi
+  if [[ -z ${NEW[EMAIL_PROVIDER]} && (-z ${NEW[OIDC_ISSUER]} || -n ${NEW[OIDC_ALLOW_SIGNUP_BYPASS]}) ]]; then
+    warn "No email delivery and no SSO with email_verified: accounts from SCIM could not sign in."
+    ask_yn "Set up SCIM anyway" n || { NEW[SCIM_BEARER_TOKEN]=""; return 0; }
+  elif [[ -n ${NEW[OIDC_ALLOW_SIGNUP_BYPASS]} ]]; then
+    printf 'Your provider sends no email_verified: accounts from SCIM sign in with a code by email, not SSO.\n'
+  fi
+  NEW[SCIM_BEARER_TOKEN]=$(keep_or_new "${NEW[SCIM_BEARER_TOKEN]}" 32)
+  printf 'At the provider: SCIM base URL https://%s/api/auth/scim/v2, token = SCIM_BEARER_TOKEN in .env.\n' \
+    "${NEW[RAKAZO_HOST]}"
+}
+
 step_catalog() {
   local mode def=1 key id secret project pd_env
   printf '\n== App catalog (optional) ==\n'
@@ -474,8 +591,55 @@ step_catalog() {
   CATALOG_MODE=$mode
 }
 
+# api_get URL HEADER… – body of a GET request. Status 0 = 200, 1 = key rejected (401/403), 2 = no
+# usable answer. The headers go through a file descriptor, so keys stay out of the process list.
+api_get() {
+  local url=$1 res
+  shift
+  command -v curl >/dev/null || return 2
+  res=$(curl -sS --max-time 20 -w '\n%{http_code}' -H @<(printf '%s\n' "$@") "$url" 2>/dev/null) || return 2
+  case ${res##*$'\n'} in
+    200) printf '%s' "${res%$'\n'*}" ;;
+    401 | 403) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# fetch_models PROVIDER KEY – sets MODELS to the model IDs the provider lists, one per line. For
+# local: fetch_models local BASE_URL [KEY]. Status as api_get.
+fetch_models() {
+  local body
+  MODELS=""
+  case $1 in
+    openrouter)
+      api_get https://openrouter.ai/api/v1/key "Authorization: Bearer $2" >/dev/null || return
+      body=$(api_get https://openrouter.ai/api/v1/models 'Accept: application/json') || return 2
+      ;;
+    anthropic)
+      body=$(api_get 'https://api.anthropic.com/v1/models?limit=1000' "x-api-key: $2" \
+        'anthropic-version: 2023-06-01') || return
+      ;;
+    deepseek) body=$(api_get https://api.deepseek.com/models "Authorization: Bearer $2") || return ;;
+    local) body=$(api_get "${2%/}/models" "Authorization: Bearer ${3:-local}") || return ;;
+  esac
+  MODELS=$(grep -o '"id" *: *"[^"]*"' <<<"$body" | sed 's/.*"\([^"]*\)"$/\1/' || true)
+  [[ -n $MODELS ]] || return 2
+}
+
+has_model() { grep -qxF -- "$1" <<<"$MODELS"; }
+
+# Lines from stdin as a,b,c.
+csv() { local s; s=$(tr '\n' ,); printf '%s' "${s%,}"; }
+
+# similar_models ID – " Similar: …" with up to five listed IDs that resemble ID
+similar_models() {
+  local s name=${1##*/}
+  s=$({ grep -iF -- "$name" <<<"$MODELS" || grep -iF -- "${name%%[-:.]*}" <<<"$MODELS"; } | head -5 | csv || true)
+  [[ -z $s ]] || printf ' Similar: %s' "${s//,/, }"
+}
+
 step_models() {
-  local mode def=1 provider label var dm key model k old_provider=${CUR[PI_DEFAULT_PROVIDER]:-openrouter}
+  local mode def=1 provider label var dm key model k st old_provider=${CUR[PI_DEFAULT_PROVIDER]:-openrouter}
   local opts=("none – every account connects its own model" "OpenRouter" "Anthropic" "DeepSeek"
     "OpenAI-compatible server (vLLM, Ollama, LM Studio, llama.cpp, LiteLLM …)")
   printf '\n== Deployment model ==\n'
@@ -491,14 +655,17 @@ step_models() {
   esac
   choose mode "$def" "${opts[@]}"
   for k in PI_DEFAULT_PROVIDER PI_DEFAULT_MODEL PI_DEFAULT_CREDENTIALS OPENROUTER_API_KEY ANTHROPIC_API_KEY \
-    DEEPSEEK_API_KEY RAKAZO_LOCAL_MODELS_URL RAKAZO_LOCAL_MODELS RAKAZO_LOCAL_VISION_MODELS \
-    RAKAZO_LOCAL_CONTEXT_WINDOW RAKAZO_LOCAL_MAX_TOKENS; do
+    DEEPSEEK_API_KEY RAKAZO_LOCAL_MODELS_URL RAKAZO_LOCAL_MODELS_API_KEY RAKAZO_LOCAL_MODELS \
+    RAKAZO_LOCAL_VISION_MODELS RAKAZO_LOCAL_CONTEXT_WINDOW RAKAZO_LOCAL_MAX_TOKENS; do
     NEW[$k]=${CUR[$k]:-}
   done
   ((mode == 6)) && return 0
   NEW[PI_DEFAULT_PROVIDER]="" NEW[PI_DEFAULT_MODEL]="" NEW[PI_DEFAULT_CREDENTIALS]=""
   case $mode in
-    2) provider=openrouter label=OpenRouter var=OPENROUTER_API_KEY dm=openai/gpt-6-luna ;;
+    2)
+      provider=openrouter label=OpenRouter var=OPENROUTER_API_KEY dm=openai/gpt-6-luna
+      on_edge && dm=anthropic/claude-haiku-5.5
+      ;;
     3) provider=anthropic label=Anthropic var=ANTHROPIC_API_KEY dm=claude-sonnet-5 ;;
     4) provider=deepseek label=DeepSeek var=DEEPSEEK_API_KEY dm=deepseek-flash ;;
     5) step_local_model; return 0 ;;
@@ -508,27 +675,70 @@ step_models() {
       return 0
       ;;
   esac
-  while :; do ask_secret key "$label API key" "${CUR[$var]:-}"; [[ -n $key ]] && break; done
+  while :; do
+    ask_secret key "$label API key" "${CUR[$var]:-}"
+    [[ -n $key ]] || continue
+    st=0
+    fetch_models "$provider" "$key" || st=$?
+    case $st in
+      0) printf 'Key works; %s lists %d models.\n' "$label" "$(wc -l <<<"$MODELS")"; break ;;
+      1) warn "$label rejects this key." && ask_yn "Use it anyway" n && break ;;
+      *) printf 'Could not ask %s for its models (offline or no curl): key and model stay unchecked.\n' "$label"; break ;;
+    esac
+  done
+  ((${#MODELS} == 0 || $(wc -l <<<"$MODELS") > 15)) || printf 'Available: %s\n' "$(csv <<<"$MODELS" | sed 's/,/, /g')"
+  [[ -z $MODELS ]] || has_model "$dm" || printf 'Rakazo'"'"'s default %s is not listed: enter a model.\n' "$dm"
   [[ $provider == "$old_provider" ]] && model=${CUR[PI_DEFAULT_MODEL]:-} || model=""
-  ask model "Model (empty = Rakazo default, currently $dm)" "$model"
+  while :; do
+    ask model "Model (empty = Rakazo default, currently $dm)" "$model"
+    [[ -z $MODELS ]] || has_model "${model:-$dm}" && break
+    warn "$label does not list \"${model:-$dm}\".$(similar_models "${model:-$dm}")"
+    ask_yn "Use it anyway" n && break
+  done
   NEW[$var]=$key NEW[PI_DEFAULT_MODEL]=$model
   [[ $provider == openrouter ]] || NEW[PI_DEFAULT_PROVIDER]=$provider
 }
 
 step_local_model() {
-  local url ids vision model ctx max e
-  printf 'API and worker must reach the server: a LAN IP, or http://host.docker.internal:<port>/v1 for a\n'
-  printf 'server on this host that listens on more than 127.0.0.1. Rakazo sends the API key "local"; a\n'
-  printf 'server that needs a real key must accept that or sit behind a proxy that adds it.\n'
+  local url key ids suggest="" vision model ctx max e st st_local
+  printf 'API and worker must reach the server: an https URL, a LAN IP, or\n'
+  printf 'http://host.docker.internal:<port>/v1 for a server on this host that listens on more than 127.0.0.1.\n'
   while :; do
-    ask url "Base URL (e.g. http://10.0.0.5:8000/v1)" "${CUR[RAKAZO_LOCAL_MODELS_URL]:-}"
+    ask url "Base URL (e.g. https://llm.example.com/v1)" "${CUR[RAKAZO_LOCAL_MODELS_URL]:-}"
     [[ $url =~ ^https?://[^/?#[:space:]]+(/[^?#[:space:]]*)?$ ]] && break
     warn "The base URL must be an http(s) URL without query or fragment."
   done
+  printf 'A server key goes into RAKAZO_LOCAL_MODELS_API_KEY. Rakazo sends it once %s is released;\n' "$LOCAL_KEY_PR"
+  printf 'until then it sends the key "local".\n'
   while :; do
-    ask ids "Model IDs on the server, comma-separated" "${CUR[RAKAZO_LOCAL_MODELS]:-}"
+    ask_secret key "Server API key (empty = none)" "${CUR[RAKAZO_LOCAL_MODELS_API_KEY]:-}"
+    st=0
+    fetch_models local "$url" "$key" || st=$?
+    case $st in
+      0) printf 'The server lists %d models: %s\n' "$(wc -l <<<"$MODELS")" "$(csv <<<"$MODELS" | sed 's/,/, /g')"; break ;;
+      1) warn "The server rejects ${key:+this key}${key:-requests without a key}." && ask_yn "Use it anyway" n && break ;;
+      *) printf 'Not reachable from this host, which is fine if only containers reach it (host.docker.internal);\n'
+         printf './generate-env.sh --check tests it from the api container once the stack runs.\n'
+         break ;;
+    esac
+  done
+  if [[ -n $key && $st == 0 ]]; then
+    st_local=0
+    api_get "${url%/}/models" 'Authorization: Bearer local' >/dev/null || st_local=$?
+    if ((st_local == 1)); then
+      warn "The server rejects the key \"local\": runs fail with 401 until Rakazo includes $LOCAL_KEY_PR."
+      warn "Until then connect it per account (Settings → Models → OpenAI-compatible) or pick another provider."
+    fi
+  fi
+  if (($(wc -l <<<"$MODELS") <= 15)); then suggest=$(csv <<<"$MODELS"); fi
+  while :; do
+    ask ids "Model IDs to offer, comma-separated" "${CUR[RAKAZO_LOCAL_MODELS]:-$suggest}"
     split_list "$ids"
-    ((${#LIST[@]})) && break
+    ((${#LIST[@]})) || continue
+    [[ -z $MODELS ]] && break
+    for e in "${LIST[@]}"; do has_model "$e" || warn "The server does not list \"$e\".$(similar_models "$e")"; done
+    for e in "${LIST[@]}"; do has_model "$e" || { ask_yn "Use the list anyway" n && break 2; continue 2; }; done
+    break
   done
   ids=$(join "${LIST[@]}")
   [[ ,$ids, == *,"${CUR[PI_DEFAULT_MODEL]:-}",* ]] && model=${CUR[PI_DEFAULT_MODEL]} || model=${LIST[0]}
@@ -550,7 +760,8 @@ step_local_model() {
       warn "Enter a positive whole number."
     done
   done
-  NEW[RAKAZO_LOCAL_MODELS_URL]=$url NEW[RAKAZO_LOCAL_MODELS]=$ids NEW[RAKAZO_LOCAL_VISION_MODELS]=$vision
+  NEW[RAKAZO_LOCAL_MODELS_URL]=$url NEW[RAKAZO_LOCAL_MODELS_API_KEY]=$key
+  NEW[RAKAZO_LOCAL_MODELS]=$ids NEW[RAKAZO_LOCAL_VISION_MODELS]=$vision
   NEW[RAKAZO_LOCAL_CONTEXT_WINDOW]=$ctx NEW[RAKAZO_LOCAL_MAX_TOKENS]=$max
   NEW[PI_DEFAULT_PROVIDER]=local NEW[PI_DEFAULT_MODEL]=$model NEW[PI_DEFAULT_CREDENTIALS]=host
 }
@@ -589,11 +800,15 @@ EOF
     cat <<'EOF'
 
 # --- Ports ----------------------------------------------------------------------------------------
-# Published on 127.0.0.1 only; Caddy forwards to them. After a change update the ports in
-# /etc/caddy/rakazo.caddy, reload Caddy and run docker compose up -d.
+# RAKAZO_BIND: 127.0.0.1 = only this host, where Caddy forwards to them. 0.0.0.0 or a host IP
+# serves web and API without TLS and past ufw. After a change update the upstreams in
+# /etc/caddy/rakazo.caddy, reload Caddy and run docker compose up -d. TRUSTED_PROXIES lists a
+# reverse proxy on another machine, so the API believes its X-Forwarded-For.
 EOF
+    env_line RAKAZO_BIND
     env_line RAKAZO_WEB_PORT
     env_line RAKAZO_API_PORT
+    env_line TRUSTED_PROXIES
     cat <<'EOF'
 
 # --- Images ---------------------------------------------------------------------------------------
@@ -637,11 +852,19 @@ EOF
     env_line SIGNUPS_ENABLED
     env_line SIGNUP_ALLOWLIST
     env_line RAKAZO_ADMIN_EMAILS
+    printf '# Edge only: SCIM token for the identity provider, base URL https://%s/api/auth/scim/v2\n' \
+      "${NEW[RAKAZO_HOST]}"
+    env_line SCIM_BEARER_TOKEN
     printf '\n# --- Email (optional) ----------------------------------------------------------------------------\n'
     env_line EMAIL_PROVIDER
     env_line EMAIL_API_KEY
     env_line SMTP_URL
     env_line EMAIL_FROM
+    printf '\n# --- Bot email addresses (edge, optional) ---------------------------------------------------------\n'
+    printf '# The relay posts each message to https://%s/api/v1/email/inbound?to=<recipient>\n' "${NEW[RAKAZO_HOST]}"
+    printf '# with Authorization: Bearer <INBOUND_EMAIL_SECRET>; see docs/self-host-inbound-email.md.\n'
+    env_line INBOUND_EMAIL_DOMAIN
+    env_line INBOUND_EMAIL_SECRET
     printf '\n# --- SSO (optional) ------------------------------------------------------------------------------\n'
     printf '# Redirect URI at the provider: https://%s/api/auth/callback/oidc\n' "${NEW[RAKAZO_HOST]}"
     env_line OIDC_ISSUER
@@ -669,6 +892,8 @@ EOF
     env_line DEEPSEEK_API_KEY
     printf '# OpenAI-compatible server: PI_DEFAULT_PROVIDER=local, PI_DEFAULT_CREDENTIALS=host and these.\n'
     env_line RAKAZO_LOCAL_MODELS_URL
+    printf '# Bearer key of that server; Rakazo sends it from %s on, before that the key "local".\n' "$LOCAL_KEY_PR"
+    env_line RAKAZO_LOCAL_MODELS_API_KEY
     env_line RAKAZO_LOCAL_MODELS
     env_line RAKAZO_LOCAL_VISION_MODELS
     env_line RAKAZO_LOCAL_CONTEXT_WINDOW
@@ -686,16 +911,172 @@ EOF
   } >"$tmp"
   chmod 600 "$tmp"
   if [[ -f $ENV_FILE ]]; then
-    backup=$ENV_FILE.bak.$(date +%Y%m%d-%H%M%S)
-    cp -p "$ENV_FILE" "$backup"
-    chmod 600 "$backup"
-    printf '\nPrevious .env backed up as %s\n' "$backup"
+    BACKUP=$ENV_FILE.bak.$(date +%Y%m%d-%H%M%S)
+    cp -p "$ENV_FILE" "$BACKUP"
+    chmod 600 "$BACKUP"
   fi
   mv "$tmp" "$ENV_FILE"
 }
 
+# --- Result --------------------------------------------------------------------------------------
+
+section() { printf '\n== %s ==\n' "$1"; }
+row() { printf '  %-17s %s\n' "$1" "$2"; }
+
+summary() {
+  local k ignored=() notes=()
+  section Done
+  printf '  .env written (mode 600)%s\n' "${BACKUP:+, previous file backed up as $BACKUP}"
+
+  section Summary
+  row Release "${NEW[RAKAZO_IMAGE_TAG]}"
+  row Domain "https://${NEW[RAKAZO_HOST]}"
+  row Ports "web ${NEW[RAKAZO_BIND]}:${NEW[RAKAZO_WEB_PORT]}, API ${NEW[RAKAZO_BIND]}:${NEW[RAKAZO_API_PORT]}"
+  [[ -z ${NEW[TRUSTED_PROXIES]} ]] || row "Trusted proxies" "${NEW[TRUSTED_PROXIES]}"
+  row Computers "$([[ ${NEW[SANDBOX_IDLE_MS]} == 0 ]] && echo 'keep running when idle' || echo 'stop when idle')"
+  row Email "${NEW[EMAIL_PROVIDER]:-none}"
+  [[ -z $(edge_val INBOUND_EMAIL_DOMAIN) ]] || row "Bot email" "${NEW[INBOUND_EMAIL_DOMAIN]}"
+  row SSO "${NEW[OIDC_ISSUER]:-off}"
+  [[ -z $(edge_val SCIM_BEARER_TOKEN) ]] || row SCIM on
+  row Signup "$(case $SIGNUP_MODE in 1) echo closed ;; 2) echo "allowlist (${NEW[SIGNUP_ALLOWLIST]})" ;; 3) echo open ;; esac)"
+  row Admins "${NEW[RAKAZO_ADMIN_EMAILS]:-none}"
+  row Model "$(deployment_model NEW)"
+  row "App catalog" "$(case $CATALOG_MODE in 1) echo none ;; 2) echo Composio ;; 3) echo "Pipedream (${NEW[PIPEDREAM_ENVIRONMENT]})" ;; esac)"
+
+  if [[ -n ${CUR[RAKAZO_IMAGE_TAG]:-} && ${CUR[RAKAZO_IMAGE_TAG]} != "${NEW[RAKAZO_IMAGE_TAG]}" ]]; then
+    notes+=("Images change to ${NEW[RAKAZO_IMAGE_TAG]}: docker compose pull && docker compose up -d")
+  fi
+  if ((PORTS_CHANGED)); then
+    notes+=("Ports changed: update them in /etc/caddy/rakazo.caddy and reload Caddy, otherwise the domain answers 502.")
+  fi
+  if ! on_edge; then
+    for k in "${EDGE_KEYS[@]}"; do
+      if [[ -n ${NEW[$k]} ]]; then ignored+=("$k"); fi
+    done
+    ((${#ignored[@]} == 0)) ||
+      notes+=("Kept in .env, but only edge or a release after v0.8.0 reads: $(join "${ignored[@]}" | sed 's/,/, /g').")
+  fi
+  for k in "${DROPPED_KEYS[@]}"; do notes+=("Removed $k from .env: fixed in docker-compose.yml or no longer needed."); done
+  if ((${#notes[@]})); then
+    section Attention
+    for k in "${notes[@]}"; do printf '  ! %s\n' "$k"; done
+  fi
+}
+
+next_steps() {
+  local caddy_ports="" caddy_sed cap scim inbound up
+  scim=$(edge_val SCIM_BEARER_TOKEN) inbound=$(edge_val INBOUND_EMAIL_DOMAIN)
+  up=$(upstream_ip "${NEW[RAKAZO_BIND]}")
+  caddy_sed="-e 's/rakazo\\.example\\.com/${NEW[RAKAZO_HOST]}/'"
+  if [[ $up != 127.0.0.1 || ${NEW[RAKAZO_WEB_PORT]} != "$DEFAULT_WEB_PORT" ||
+    ${NEW[RAKAZO_API_PORT]} != "$DEFAULT_API_PORT" ]]; then
+    caddy_ports=" and upstreams $up:${NEW[RAKAZO_WEB_PORT]} (web), $up:${NEW[RAKAZO_API_PORT]} (API)"
+    caddy_sed+=" -e 's/127\\.0\\.0\\.1:$DEFAULT_WEB_PORT /$up:${NEW[RAKAZO_WEB_PORT]} /'"
+    caddy_sed+=" -e 's/127\\.0\\.0\\.1:$DEFAULT_API_PORT /$up:${NEW[RAKAZO_API_PORT]} /'"
+  fi
+
+  section "Once per host"
+  if [[ ${NEW[RAKAZO_BIND]} != 127.0.0.1 && -n ${NEW[TRUSTED_PROXIES]} ]]; then
+    [[ ${NEW[RAKAZO_BIND]} != 0.0.0.0 ]] || up="<IP of this host>"
+    cat <<EOF
+  1. DNS
+     A/AAAA record for ${NEW[RAKAZO_HOST]} pointing to your reverse proxy.
+  2. Reverse proxy (${NEW[TRUSTED_PROXIES]#local-networks,})
+     Terminates TLS for ${NEW[RAKAZO_HOST]} and forwards /health, /api/* and /rpc/* to
+     $up:${NEW[RAKAZO_API_PORT]}, everything else to $up:${NEW[RAKAZO_WEB_PORT]}, with
+     X-Forwarded-For set to the client. Caddy template: ${CADDY_EXAMPLE_URL}
+     Allow only the proxy to reach these ports; they serve plain HTTP.
+EOF
+  else
+    cat <<EOF
+  1. DNS
+     A/AAAA record for ${NEW[RAKAZO_HOST]} pointing to this host. Open 80/tcp and 443/tcp
+     (443/udp for HTTP/3).
+  2. Caddy
+     Save Caddyfile.example as /etc/caddy/rakazo.caddy with your domain${caddy_ports}:
+       sudo curl -fsSLo /etc/caddy/rakazo.caddy ${CADDY_EXAMPLE_RAW}
+       sudo sed -i ${caddy_sed} /etc/caddy/rakazo.caddy
+     Once in /etc/caddy/Caddyfile: import /etc/caddy/rakazo.caddy, then
+       sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
+     Template: ${CADDY_EXAMPLE_URL}
+EOF
+  fi
+  cat <<'EOF'
+  3. Docker daemon (recommended)
+     Every Private bot and every space gets its own Docker network; the built-in address pools hold
+     only about 30. Computers are created by the supervisor, so only the daemon rotates their logs.
+     In /etc/docker/daemon.json (if it exists, add only the keys; the range must not overlap your
+     LAN, VPN or cloud network, see ip route):
+       {
+         "default-address-pools": [{ "base": "10.200.0.0/16", "size": 24 }],
+         "log-driver": "json-file",
+         "log-opts": { "max-size": "5m", "max-file": "3" }
+       }
+       sudo dockerd --validate --config-file /etc/docker/daemon.json && sudo systemctl restart docker
+EOF
+  cap=$(pool_capacity)
+  [[ -z $cap ]] || printf '     Address pools are already configured here: room for %s networks.\n' "$cap"
+  cat <<'EOF'
+  4. Computer firewall (recommended)
+     Keeps computers away from the host, the LAN and cloud metadata (169.254.169.254); without it
+     they have open network access. Docker Engine with iptables; read the script first:
+       curl -fsSLo /tmp/restrict-computer-egress.sh \
+         https://raw.githubusercontent.com/elie222/rakazo/main/infra/compose/restrict-computer-egress.sh
+       sudo bash /tmp/restrict-computer-egress.sh
+     If the stack already runs: docker compose up -d --force-recreate supervisor
+EOF
+
+  section Start
+  printf '  5. docker compose up -d\n'
+  printf '  6. ./generate-env.sh --check\n'
+  if ((SIGNUP_MODE == 1)) && [[ -z $scim ]]; then
+    printf '  7. ./generate-env.sh --owner   the admin account with a password, the only way in while signup is closed\n'
+  else
+    printf '  7. ./generate-env.sh --owner   the admin account with a password\n'
+  fi
+
+  if [[ -n ${NEW[OIDC_ISSUER]}$scim ]]; then
+    section "At the identity provider"
+    if [[ -n ${NEW[OIDC_ISSUER]} ]]; then
+      row "Redirect URI" "https://${NEW[RAKAZO_HOST]}/api/auth/callback/oidc"
+      row "ID token" "needs the email claim (Entra ID: Token configuration → optional claim email)"
+      if [[ -n ${NEW[OIDC_ALLOW_SIGNUP_BYPASS]} ]]; then
+        row Access "everyone the provider lets in can sign up with SSO; restrict it there"
+        row "" "(Entra ID: Enterprise application → Properties → Assignment required = Yes)"
+        row "Admin account" "signs in with its password; SSO accounts stay unverified and cannot be admins"
+      else
+        row Access "the provider must send email_verified=true"
+        case $SIGNUP_MODE in
+          1) [[ -n $scim ]] || row "" "signup is closed, so SSO cannot create new accounts" ;;
+          2) row "" "addresses on the allowlist (${NEW[SIGNUP_ALLOWLIST]}) create their account with SSO" ;;
+        esac
+        row "Admin account" "signs in with its password first, then Link SSO in the account settings"
+      fi
+    fi
+    if [[ -n $scim ]]; then
+      row SCIM "base URL https://${NEW[RAKAZO_HOST]}/api/auth/scim/v2, token: grep ^SCIM_BEARER_TOKEN= .env"
+      row "" "(Entra ID: Enterprise application → Provisioning → Automatic, Tenant URL and Secret Token)"
+    fi
+  fi
+
+  if [[ -n $inbound ]]; then
+    section "Bot email"
+    printf '  Route all mail for %s to a relay (Cloudflare Email Routing or Postfix) that posts\n' "$inbound"
+    printf '  each message to https://%s/api/v1/email/inbound?to=<recipient> with\n' "${NEW[RAKAZO_HOST]}"
+    printf '  Authorization: Bearer <INBOUND_EMAIL_SECRET>. Guide: %s\n' "$INBOUND_EMAIL_DOCS"
+  fi
+
+  section Later
+  row Update "docker compose pull && docker compose up -d"
+  row "Change settings" "./generate-env.sh, then docker compose up -d"
+  row Check "./generate-env.sh --check"
+  if on_edge; then
+    row "Lock someone out" "./generate-env.sh --deactivate EMAIL (undo with --reactivate)"
+  fi
+}
+
 generate() {
-  local k caddy_note caddy_sed cap
+  local k
   command -v openssl >/dev/null || die "openssl is missing."
   [[ -t 0 ]] || die "Please run interactively in a terminal."
   load_env
@@ -711,12 +1092,14 @@ New values would not match (sign-in fails, stored credentials become unreadable)
   fi
   printf 'Enter keeps the value in [ ], "-" clears a field.\n'
 
+  step_images
   step_domain
   step_ports
-  step_images
   step_computers
   step_email
+  step_bot_email
   step_sso
+  step_directory
   step_admins
   step_signups
   step_catalog
@@ -725,97 +1108,8 @@ New values would not match (sign-in fails, stored credentials become unreadable)
   write_env
   mkdir -p data/postgres data/app data/web-assets credentials
 
-  printf '\n.env written (mode 600).\n'
-  for k in "${DROPPED_KEYS[@]}"; do
-    printf '  removed: %s (fixed in docker-compose.yml or no longer needed)\n' "$k"
-  done
-  printf '\n  Domain:        https://%s\n' "${NEW[RAKAZO_HOST]}"
-  printf '  Computers:     %s\n' "$([[ ${NEW[SANDBOX_IDLE_MS]} == 0 ]] && echo 'keep running when idle' || echo 'stop when idle')"
-  printf '  Email:         %s\n' "${NEW[EMAIL_PROVIDER]:-none}"
-  printf '  Signup:        %s\n' "$(case $SIGNUP_MODE in 1) echo closed ;; 2) echo "allowlist (${NEW[SIGNUP_ALLOWLIST]})" ;; 3) echo open ;; esac)"
-  printf '  Ports:         web 127.0.0.1:%s, API 127.0.0.1:%s\n' "${NEW[RAKAZO_WEB_PORT]}" "${NEW[RAKAZO_API_PORT]}"
-  printf '  Images:        %s\n' "${NEW[RAKAZO_IMAGE_TAG]}"
-  printf '  SSO:           %s\n' "${NEW[OIDC_ISSUER]:-off}"
-  printf '  Model:         %s\n' "$(deployment_model NEW)"
-  printf '  App catalog:   %s\n' "$(case $CATALOG_MODE in 1) echo none ;; 2) echo Composio ;; 3) echo "Pipedream (${NEW[PIPEDREAM_ENVIRONMENT]})" ;; esac)"
-  caddy_note=. caddy_sed="-e 's/rakazo\\.example\\.com/${NEW[RAKAZO_HOST]}/'"
-  if [[ ${NEW[RAKAZO_WEB_PORT]} != "$DEFAULT_WEB_PORT" || ${NEW[RAKAZO_API_PORT]} != "$DEFAULT_API_PORT" ]]; then
-    caddy_note=",
-     the web port $DEFAULT_WEB_PORT with ${NEW[RAKAZO_WEB_PORT]} and the API port $DEFAULT_API_PORT with ${NEW[RAKAZO_API_PORT]}."
-    caddy_sed+=" -e 's/127\\.0\\.0\\.1:$DEFAULT_WEB_PORT /127.0.0.1:${NEW[RAKAZO_WEB_PORT]} /'"
-    caddy_sed+=" -e 's/127\\.0\\.0\\.1:$DEFAULT_API_PORT /127.0.0.1:${NEW[RAKAZO_API_PORT]} /'"
-  fi
-  if [[ -n ${CUR[RAKAZO_IMAGE_TAG]:-} && ${CUR[RAKAZO_IMAGE_TAG]} != "${NEW[RAKAZO_IMAGE_TAG]}" ]]; then
-    warn "Images change to ${NEW[RAKAZO_IMAGE_TAG]}: docker compose pull && docker compose up -d"
-  fi
-  if ((PORTS_CHANGED)); then
-    warn "Ports changed: update the ports in /etc/caddy/rakazo.caddy and reload Caddy, otherwise the domain answers 502."
-  fi
-
-  cat <<EOF
-
-Next steps
-  1. DNS: A/AAAA record for ${NEW[RAKAZO_HOST]} pointing to this host.
-     Ports 80/tcp and 443/tcp open (443/udp for HTTP/3).
-  2. Caddy on the host: get Caddyfile.example from GitHub, save it as /etc/caddy/rakazo.caddy
-     and replace rakazo.example.com with ${NEW[RAKAZO_HOST]}${caddy_note}
-       ${CADDY_EXAMPLE_URL}
-       sudo curl -fsSLo /etc/caddy/rakazo.caddy ${CADDY_EXAMPLE_RAW}
-       sudo sed -i ${caddy_sed} /etc/caddy/rakazo.caddy
-       once in /etc/caddy/Caddyfile:  import /etc/caddy/rakazo.caddy
-       sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
-EOF
-  cat <<'EOF'
-  3. Recommended, once per host: /etc/docker/daemon.json (if the file exists, add only the keys).
-     Address pools: every Private bot and every space gets its own Docker network, the built-in
-     pools hold only about 30; the range must not overlap your LAN, VPN or cloud network (ip route).
-     Log rotation: the stack rotates its logs via docker-compose.yml, but bot computers are created
-     by the supervisor and use the daemon's settings (applies to computers created afterwards).
-       {
-         "default-address-pools": [{ "base": "10.200.0.0/16", "size": 24 }],
-         "log-driver": "json-file",
-         "log-opts": { "max-size": "5m", "max-file": "3" }
-       }
-       sudo dockerd --validate --config-file /etc/docker/daemon.json && sudo systemctl restart docker
-EOF
-  cap=$(pool_capacity)
-  [[ -z $cap ]] || printf '     Address pools are already configured here: room for %s networks.\n' "$cap"
-  cat <<EOF
-  4. Recommended, once per host: keep computers away from the host, the LAN and cloud metadata
-     (169.254.169.254). Without these firewall rules computers have open network access. Linux with
-     Docker Engine and iptables; read the script first:
-       curl -fsSLo /tmp/restrict-computer-egress.sh \\
-         https://raw.githubusercontent.com/elie222/rakazo/main/infra/compose/restrict-computer-egress.sh
-       sudo bash /tmp/restrict-computer-egress.sh
-     If the stack is already running: docker compose up -d --force-recreate supervisor
-  5. Start the stack:  docker compose up -d
-     Updates later:    docker compose pull && docker compose up -d
-  6. Check:            ./generate-env.sh --check
-EOF
-  if ((SIGNUP_MODE == 1)); then
-    printf '  7. Create the first account with a password, the only way in while signup is closed:\n'
-  else
-    printf '  7. Create the admin account with a password:\n'
-  fi
-  printf '       ./generate-env.sh --owner\n'
-  if [[ -n ${NEW[OIDC_ISSUER]} ]]; then
-    printf '\nSSO: redirect URI at the provider: https://%s/api/auth/callback/oidc\n' "${NEW[RAKAZO_HOST]}"
-    printf 'The ID token needs the email claim (Entra ID: Token configuration → optional claim email).\n'
-    if [[ -n ${NEW[OIDC_ALLOW_SIGNUP_BYPASS]} ]]; then
-      printf 'Without email_verified everyone the provider lets in can sign up with SSO; restrict it there\n'
-      printf '(Entra ID: Enterprise application → Properties → Assignment required = Yes, assign users).\n'
-      printf 'SSO accounts stay unverified: no admin rights from RAKAZO_ADMIN_EMAILS. The --owner account\n'
-      printf 'cannot be linked to SSO and keeps signing in with its password.\n'
-    else
-      printf 'The provider must send email_verified=true. An account from --owner signs in with its\n'
-      printf 'password first and then chooses Link SSO in the account settings; SSO sign-in with the same\n'
-      printf 'address is refused until then.\n'
-      case $SIGNUP_MODE in
-        1) printf 'Signup is closed, so SSO cannot create new accounts.\n' ;;
-        2) printf 'Addresses on the allowlist (%s) can create their account with SSO directly.\n' "${NEW[SIGNUP_ALLOWLIST]}" ;;
-      esac
-    fi
-  fi
+  summary
+  next_steps
 }
 
 # --- Owner ---------------------------------------------------------------------------------------
@@ -866,12 +1160,43 @@ owner() {
   fi
 }
 
+# account_status deactivate|reactivate EMAIL
+account_status() {
+  local action=$1 email=${2:-} res
+  email=${email,,}
+  valid_email "$email" || die "Usage: ./generate-env.sh --$action <email>"
+  [[ -f $ENV_FILE ]] || die "No .env found. Run ./generate-env.sh first."
+  [[ -n $(docker compose ps -q --status running api 2>/dev/null) ]] ||
+    die "The api service is not running. Start the stack first: docker compose up -d"
+  docker compose exec -T api node -e \
+    "process.exit(require('fs').existsSync('dist/cli/account-status.js')?0:1)" >/dev/null 2>&1 ||
+    die "The running images cannot lock accounts: that needs edge or a release after v0.8.0."
+  if ! res=$(docker compose exec -T api node dist/cli/account-status.js "$action" "$email" 2>&1); then
+    printf '%s\n' "$res" | grep -v '^\s*at ' | sed 's/^/  /' >&2 || true
+    die "Account $email was not changed."
+  fi
+  case $res in
+    *"Already deactivated"*) printf '%s was already locked.\n' "$email" ;;
+    *"Already active"*) printf '%s is already active.\n' "$email" ;;
+    *Deactivated*)
+      printf '%s is locked: sign-ins, paired computers and runs ended, routines are skipped.\n' "$email"
+      printf 'Bots, chats and files stay. Spaces shared by others pass what they made there to the owner.\n'
+      ;;
+    *Reactivated*)
+      printf '%s is unlocked: own spaces and routines are back. Shared spaces need a new invite.\n' "$email"
+      ;;
+    *) printf '%s\n' "$res" ;;
+  esac
+}
+
 # --- Check ---------------------------------------------------------------------------------------
 
 ERRORS=0
 ok()   { printf '  ok      %s\n' "$*"; }
 bad()  { printf '  ERROR   %s\n' "$*"; ERRORS=$((ERRORS + 1)); }
 hint() { printf '  note    %s\n' "$*"; }
+# For features only edge has so far: an error on edge, a note with older images.
+edge_bad() { if [[ ${CUR[RAKAZO_IMAGE_TAG]:-} == edge ]]; then bad "$@"; else hint "$@"; fi; }
 
 # http_probe URL [curl options …] – prints the headers, the last 3 characters are the status
 # (000 = no connection).
@@ -909,7 +1234,34 @@ health_has() {
 # Pings the Docker daemon from inside the supervisor, over the same socket it uses for computers.
 DOCKER_PING_JS="require('http').get({socketPath:'/var/run/docker.sock',path:'/_ping'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 # Lists the models of the OpenAI-compatible server the way the API reaches it.
-LOCAL_MODELS_JS="fetch(process.env.RAKAZO_LOCAL_MODELS_URL.replace(/\\/\$/,'')+'/models',{headers:{authorization:'Bearer local'},signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+LOCAL_MODELS_JS="fetch(process.env.RAKAZO_LOCAL_MODELS_URL.replace(/\\/\$/,'')+'/models',{headers:{authorization:'Bearer '+(process.env.RAKAZO_LOCAL_MODELS_API_KEY||'local')},signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+# check_scim BASE_URL label – lists one user with the token, as the identity provider does
+check_scim() {
+  local res
+  res=$(http_probe "$1/api/auth/scim/v2/Users?count=1" \
+    -H @<(printf 'Authorization: Bearer %s\n' "${CUR[SCIM_BEARER_TOKEN]}"))
+  case ${res: -3} in
+    200) ok "$2: SCIM accepts SCIM_BEARER_TOKEN" ;;
+    401 | 403) bad "$2: SCIM rejects SCIM_BEARER_TOKEN (after a change: docker compose up -d)" ;;
+    404) edge_bad "$2: no SCIM endpoint (needs edge; after a change: docker compose up -d)" ;;
+    000) bad "$2: no answer from the SCIM endpoint" ;;
+    *) bad "$2: SCIM answers ${res: -3}" ;;
+  esac
+}
+
+# check_inbound BASE_URL label – posts without the secret: 401 means the relay endpoint is there
+check_inbound() {
+  local res
+  res=$(http_probe "$1/api/v1/email/inbound?to=check@${CUR[INBOUND_EMAIL_DOMAIN]}" -X POST \
+    -H 'Content-Type: message/rfc822')
+  case ${res: -3} in
+    401) ok "$2: the bot email endpoint is there and requires INBOUND_EMAIL_SECRET" ;;
+    404) edge_bad "$2: no bot email endpoint (needs edge; after a change: docker compose up -d)" ;;
+    000) bad "$2: no answer from the bot email endpoint" ;;
+    *) bad "$2: the bot email endpoint answers ${res: -3} instead of 401 without the secret" ;;
+  esac
+}
 
 # Asks the screen proxy in the web container about an invalid capability, which it has the API
 # verify: 403 with its own message means /novnc/ reaches the proxy and the proxy reaches the API.
@@ -927,21 +1279,35 @@ check_screen() { # check_screen BASE_URL label [curl options …]
 }
 
 check() {
-  local k v host origin code res pw app_pw e running web api caddy_file img cap
+  local k v host origin code res pw app_pw e running web api up caddy_file img cap
   [[ -f $ENV_FILE ]] || die "No .env found. Run ./generate-env.sh first."
   load_env
   host=${CUR[RAKAZO_HOST]:-}
   origin=https://$host
-  web=127.0.0.1:${CUR[RAKAZO_WEB_PORT]:-}
-  api=127.0.0.1:${CUR[RAKAZO_API_PORT]:-}
+  up=$(upstream_ip "${CUR[RAKAZO_BIND]:-127.0.0.1}")
+  web=$up:${CUR[RAKAZO_WEB_PORT]:-}
+  api=$up:${CUR[RAKAZO_API_PORT]:-}
 
   printf '.env\n'
   [[ $(stat -c %a "$ENV_FILE" 2>/dev/null || echo 600) == 600 ]] ||
     hint ".env is not mode 600: chmod 600 .env"
-  for k in RAKAZO_HOST WEB_ORIGIN BETTER_AUTH_URL API_URL RAKAZO_WEB_PORT RAKAZO_API_PORT RAKAZO_IMAGE_TAG \
-    POSTGRES_PASSWORD DATABASE_URL DATABASE_MIGRATION_URL "${SECRET_KEYS[@]}"; do
+  for k in RAKAZO_HOST WEB_ORIGIN BETTER_AUTH_URL API_URL RAKAZO_BIND RAKAZO_WEB_PORT RAKAZO_API_PORT \
+    RAKAZO_IMAGE_TAG POSTGRES_PASSWORD DATABASE_URL DATABASE_MIGRATION_URL "${SECRET_KEYS[@]}"; do
     [[ -n ${CUR[$k]:-} ]] || bad "$k is missing or empty"
   done
+  case ${CUR[RAKAZO_BIND]:-} in
+    "" | 127.0.0.1) ;;
+    0.0.0.0) hint "RAKAZO_BIND=0.0.0.0: web and API answer on every network without TLS, past ufw" ;;
+    *)
+      if ! valid_ipv4 "${CUR[RAKAZO_BIND]}"; then bad "RAKAZO_BIND \"${CUR[RAKAZO_BIND]}\" is not an IPv4 address"
+      elif command -v ip >/dev/null && ! ip -4 -o addr show | grep -qF " ${CUR[RAKAZO_BIND]}/"; then
+        bad "RAKAZO_BIND ${CUR[RAKAZO_BIND]} is no address of this host: the stack cannot publish its ports"
+      else hint "RAKAZO_BIND=${CUR[RAKAZO_BIND]}: web and API answer there without TLS, past ufw"; fi
+      ;;
+  esac
+  if [[ ${CUR[RAKAZO_BIND]:-127.0.0.1} != 127.0.0.1 && -z ${CUR[TRUSTED_PROXIES]:-} ]]; then
+    hint "a reverse proxy on another machine needs TRUSTED_PROXIES, otherwise all users share one sign-in rate limit"
+  fi
   for k in RAKAZO_WEB_PORT RAKAZO_API_PORT; do
     [[ -z ${CUR[$k]:-} ]] || valid_port "${CUR[$k]}" || bad "$k \"${CUR[$k]}\" is not a port"
   done
@@ -1024,6 +1390,30 @@ check() {
     *) [[ ${CUR[RAKAZO_IMAGE_TAG]} =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
          bad "RAKAZO_IMAGE_TAG \"${CUR[RAKAZO_IMAGE_TAG]}\" is not a valid image tag" ;;
   esac
+  if [[ ${CUR[RAKAZO_IMAGE_TAG]:-} != edge ]]; then
+    for k in "${EDGE_KEYS[@]}"; do
+      if [[ -n ${CUR[$k]:-} ]]; then hint "$k needs edge or a release after v0.8.0; older images ignore it"; fi
+    done
+  fi
+  v=${CUR[SCIM_BEARER_TOKEN]:-}
+  if [[ -n $v ]]; then
+    ((${#v} >= 32)) && [[ $v != *[[:space:]]* ]] ||
+      bad "SCIM_BEARER_TOKEN needs at least 32 characters without spaces (the API does not start otherwise)"
+    if [[ -z ${CUR[EMAIL_PROVIDER]:-}${CUR[SMTP_URL]:-} &&
+      (-z ${CUR[OIDC_ISSUER]:-} || ${CUR[OIDC_ALLOW_SIGNUP_BYPASS]:-} == true) ]]; then
+      bad "accounts from SCIM cannot sign in: no email delivery for codes and no SSO with email_verified"
+    fi
+  fi
+  if [[ -n ${CUR[INBOUND_EMAIL_DOMAIN]:-}${CUR[INBOUND_EMAIL_SECRET]:-} ]]; then
+    if [[ -z ${CUR[INBOUND_EMAIL_DOMAIN]:-} || -z ${CUR[INBOUND_EMAIL_SECRET]:-} ]]; then
+      bad "set INBOUND_EMAIL_DOMAIN and INBOUND_EMAIL_SECRET together (the API does not start otherwise)"
+    else
+      valid_host "${CUR[INBOUND_EMAIL_DOMAIN],,}" ||
+        bad "INBOUND_EMAIL_DOMAIN \"${CUR[INBOUND_EMAIL_DOMAIN]}\" is not a domain name (the API does not start otherwise)"
+      ((${#CUR[INBOUND_EMAIL_SECRET]} >= 32)) ||
+        bad "INBOUND_EMAIL_SECRET is shorter than 32 characters (the API does not start otherwise)"
+    fi
+  fi
   if [[ ${CUR[PI_DEFAULT_PROVIDER]:-} == local ]]; then
     [[ ${CUR[PI_DEFAULT_CREDENTIALS]:-} == host ]] ||
       bad "PI_DEFAULT_PROVIDER=local needs PI_DEFAULT_CREDENTIALS=host"
@@ -1032,6 +1422,8 @@ check() {
     [[ ${CUR[RAKAZO_LOCAL_MODELS_URL]:-} =~ ^https?:// ]] ||
       bad "RAKAZO_LOCAL_MODELS_URL must be an http(s) URL"
   fi
+  [[ -z ${CUR[RAKAZO_LOCAL_MODELS_API_KEY]:-} ]] ||
+    hint "RAKAZO_LOCAL_MODELS_API_KEY is sent only by Rakazo with $LOCAL_KEY_PR; older images send \"local\""
   v=$(deployment_model CUR)
   if [[ $v == none* ]]; then
     hint "no deployment model: every new account has to connect its own model provider (./generate-env.sh)"
@@ -1068,7 +1460,7 @@ check() {
 
   if [[ -n ${running:-} ]]; then
     command -v curl >/dev/null || die "curl is missing for the runtime checks."
-    printf '\nLocal (127.0.0.1)\n'
+    printf '\nLocal (%s)\n' "$up"
     res=$(http_probe "http://$api/health")
     [[ ${res: -3} == 200 ]] && ok "API $api/health" || bad "API $api/health answers ${res: -3}"
     code=$(http_probe "http://$web/" -H "Host: $host")
@@ -1096,6 +1488,8 @@ check() {
         bad "API cannot list ${CUR[RAKAZO_LOCAL_MODELS_URL]:-}/models (address from inside a container? server bound to 127.0.0.1 only?)"
       fi
     fi
+    [[ -z ${CUR[SCIM_BEARER_TOKEN]:-} ]] || check_scim "http://$api" "API"
+    [[ -z ${CUR[INBOUND_EMAIL_DOMAIN]:-} || -z ${CUR[INBOUND_EMAIL_SECRET]:-} ]] || check_inbound "http://$api" "API"
 
     printf '\nAccounts\n'
     split_list "${CUR[RAKAZO_ADMIN_EMAILS]:-}"
@@ -1120,7 +1514,9 @@ check() {
 
     printf '\nCaddy\n'
     caddy_file=/etc/caddy/rakazo.caddy
-    if [[ ! -r $caddy_file ]]; then
+    if [[ ${CUR[RAKAZO_BIND]:-127.0.0.1} != 127.0.0.1 && -n ${CUR[TRUSTED_PROXIES]:-} && ! -r $caddy_file ]]; then
+      hint "reverse proxy on another machine (${CUR[TRUSTED_PROXIES]#local-networks,}): checked through $origin below"
+    elif [[ ! -r $caddy_file ]]; then
       hint "$caddy_file not found: get Caddyfile.example from $CADDY_EXAMPLE_URL"
     elif grep -qF rakazo.example.com "$caddy_file"; then
       bad "$caddy_file still contains rakazo.example.com: replace it with $host, reload Caddy"
@@ -1185,6 +1581,9 @@ check() {
         [[ ${code: -3} == 200 ]] && ok "$origin/ (web)" || bad "$origin/ answers ${code: -3}"
         check_cors "$origin" "$origin" "Caddy"
         check_screen "$origin" "Caddy"
+        [[ -z ${CUR[SCIM_BEARER_TOKEN]:-} ]] || check_scim "$origin" "Caddy"
+        [[ -z ${CUR[INBOUND_EMAIL_DOMAIN]:-} || -z ${CUR[INBOUND_EMAIL_SECRET]:-} ]] ||
+          check_inbound "$origin" "Caddy"
       elif [[ $code == 000 ]]; then
         bad "$origin not reachable (Caddy running? certificate? ports 80/443 open? sudo journalctl -u caddy)"
       else
@@ -1202,12 +1601,14 @@ check() {
   printf 'All good.\n'
 }
 
-usage() { sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case ${1-} in
   "") generate ;;
   --owner) owner ;;
   --check) check ;;
+  --deactivate) account_status deactivate "${2-}" ;;
+  --reactivate) account_status reactivate "${2-}" ;;
   -h | --help) usage ;;
   *) die "Unknown option: $1 (see --help)" ;;
 esac
