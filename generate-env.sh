@@ -42,9 +42,7 @@ MANAGED_KEYS=(
   SCIM_BEARER_TOKEN INBOUND_EMAIL_DOMAIN INBOUND_EMAIL_SECRET
 )
 # Read only by edge until the release after v0.8.0.
-EDGE_KEYS=(SCIM_BEARER_TOKEN INBOUND_EMAIL_DOMAIN INBOUND_EMAIL_SECRET)
-# Proposed upstream, not in any image yet: https://github.com/elie222/rakazo/pull/4071
-LOCAL_KEY_PR=elie222/rakazo#4071
+EDGE_KEYS=(SCIM_BEARER_TOKEN INBOUND_EMAIL_DOMAIN INBOUND_EMAIL_SECRET RAKAZO_LOCAL_MODELS_API_KEY)
 # No effect in .env: fixed in docker-compose.yml or left over from the upstream setup.
 FIXED_KEYS=(
   NODE_ENV DATA_DIR WAKEUP_DRIVER AGENT_RUNTIME SANDBOX_PROVIDER SANDBOX_SUPERVISOR_URL
@@ -708,8 +706,7 @@ step_local_model() {
     [[ $url =~ ^https?://[^/?#[:space:]]+(/[^?#[:space:]]*)?$ ]] && break
     warn "The base URL must be an http(s) URL without query or fragment."
   done
-  printf 'A server key goes into RAKAZO_LOCAL_MODELS_API_KEY. Rakazo sends it once %s is released;\n' "$LOCAL_KEY_PR"
-  printf 'until then it sends the key "local".\n'
+  on_edge || printf 'Only edge or a release after v0.8.0 sends a server key; older images send the key "local".\n'
   while :; do
     ask_secret key "Server API key (empty = none)" "${CUR[RAKAZO_LOCAL_MODELS_API_KEY]:-}"
     st=0
@@ -722,12 +719,12 @@ step_local_model() {
          break ;;
     esac
   done
-  if [[ -n $key && $st == 0 ]]; then
+  if [[ -n $key && $st == 0 ]] && ! on_edge; then
     st_local=0
     api_get "${url%/}/models" 'Authorization: Bearer local' >/dev/null || st_local=$?
     if ((st_local == 1)); then
-      warn "The server rejects the key \"local\": runs fail with 401 until Rakazo includes $LOCAL_KEY_PR."
-      warn "Until then connect it per account (Settings → Models → OpenAI-compatible) or pick another provider."
+      warn "The server rejects the key \"local\" that ${NEW[RAKAZO_IMAGE_TAG]} sends: runs fail with 401."
+      warn "Choose edge, connect it per account (Settings → Models → OpenAI-compatible) or pick another provider."
     fi
   fi
   if (($(wc -l <<<"$MODELS") <= 15)); then suggest=$(csv <<<"$MODELS"); fi
@@ -892,7 +889,7 @@ EOF
     env_line DEEPSEEK_API_KEY
     printf '# OpenAI-compatible server: PI_DEFAULT_PROVIDER=local, PI_DEFAULT_CREDENTIALS=host and these.\n'
     env_line RAKAZO_LOCAL_MODELS_URL
-    printf '# Bearer key of that server; Rakazo sends it from %s on, before that the key "local".\n' "$LOCAL_KEY_PR"
+    printf '# Bearer key of that server (edge or a release after v0.8.0; older images send the key "local").\n'
     env_line RAKAZO_LOCAL_MODELS_API_KEY
     env_line RAKAZO_LOCAL_MODELS
     env_line RAKAZO_LOCAL_VISION_MODELS
@@ -1279,7 +1276,7 @@ check_screen() { # check_screen BASE_URL label [curl options …]
 }
 
 check() {
-  local k v host origin code res pw app_pw e running web api up caddy_file img cap
+  local k v host origin code res pw app_pw e running web api up caddy_file img cap key_env
   [[ -f $ENV_FILE ]] || die "No .env found. Run ./generate-env.sh first."
   load_env
   host=${CUR[RAKAZO_HOST]:-}
@@ -1422,8 +1419,6 @@ check() {
     [[ ${CUR[RAKAZO_LOCAL_MODELS_URL]:-} =~ ^https?:// ]] ||
       bad "RAKAZO_LOCAL_MODELS_URL must be an http(s) URL"
   fi
-  [[ -z ${CUR[RAKAZO_LOCAL_MODELS_API_KEY]:-} ]] ||
-    hint "RAKAZO_LOCAL_MODELS_API_KEY is sent only by Rakazo with $LOCAL_KEY_PR; older images send \"local\""
   v=$(deployment_model CUR)
   if [[ $v == none* ]]; then
     hint "no deployment model: every new account has to connect its own model provider (./generate-env.sh)"
@@ -1482,7 +1477,10 @@ check() {
     done
 
     if [[ ${CUR[PI_DEFAULT_PROVIDER]:-} == local ]]; then
-      if docker compose exec -T api node -e "$LOCAL_MODELS_JS" >/dev/null 2>&1; then
+      # Images before edge send the key "local" whatever .env holds.
+      key_env=()
+      [[ ${CUR[RAKAZO_IMAGE_TAG]:-} == edge ]] || key_env=(-e RAKAZO_LOCAL_MODELS_API_KEY=)
+      if docker compose exec -T "${key_env[@]}" api node -e "$LOCAL_MODELS_JS" >/dev/null 2>&1; then
         ok "API reaches the model server ${CUR[RAKAZO_LOCAL_MODELS_URL]:-}"
       else
         bad "API cannot list ${CUR[RAKAZO_LOCAL_MODELS_URL]:-}/models (address from inside a container? server bound to 127.0.0.1 only?)"
