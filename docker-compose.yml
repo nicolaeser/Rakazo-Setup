@@ -1,0 +1,184 @@
+name: rakazo
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: rakazo
+      POSTGRES_DB: rakazo
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rakazo -d rakazo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  computer:
+    image: ghcr.io/elie222/rakazo/computer:latest
+    command: ["true"]
+    restart: "no"
+
+  data-init:
+    image: busybox:latest
+    command: ["find", "/data", "/web-assets", "!", "(", "-user", "1000", "-group", "1000", ")", "-exec", "chown", "-h", "1000:1000", "{}", "+"]
+    restart: "no"
+    volumes:
+      - ./data/app:/data
+      - ./data/web-assets:/web-assets
+
+  supervisor:
+    image: ghcr.io/elie222/rakazo/app:latest
+    restart: unless-stopped
+    command: ["pnpm", "--filter", "@rakazo/sandbox-supervisor", "start"]
+    user: root
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATA_DIR: /data
+      SUPERVISOR_HOST: "0.0.0.0"
+      SUPERVISOR_PORT: "7091"
+      DOCKER_SOCKET: /var/run/docker.sock
+      MAX_UPLOAD_SIZE_MB: "10"
+      RAKAZO_COMPUTER_IMAGE: ghcr.io/elie222/rakazo/computer:latest
+      RAKAZO_COMPUTER_MEMORY: 2g
+      RAKAZO_COMPUTER_CPUS: "2"
+      RAKAZO_COMPUTER_PIDS_LIMIT: "2048"
+      SANDBOX_COMMAND_TIMEOUT_MS: "300000"
+      SANDBOX_SCREEN_NETWORK: isolated
+      SANDBOX_COMPUTER_EGRESS: auto
+      LOG_LEVEL: info
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data/app:/data
+    depends_on:
+      computer:
+        condition: service_completed_successfully
+      data-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:7091/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    image: ghcr.io/elie222/rakazo/app:latest
+    working_dir: /app/apps/api
+    command: ["pnpm", "db:deploy"]
+    restart: "no"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    image: ghcr.io/elie222/rakazo/app:latest
+    restart: unless-stopped
+    working_dir: /app/apps/api
+    command: ["node", "--enable-source-maps", "dist/index.js"]
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATA_DIR: /data
+      WAKEUP_DRIVER: graphile
+      AGENT_RUNTIME: pi
+      SANDBOX_PROVIDER: docker
+      SANDBOX_SUPERVISOR_URL: http://supervisor:7091
+      CONTENT_ENCRYPTION: "on"
+      MAX_UPLOAD_SIZE_MB: "10"
+      API_HOST: "0.0.0.0"
+      API_PORT: "3100"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/app:/data
+      - ./credentials:/credentials:ro
+    ports:
+      - "127.0.0.1:${RAKAZO_API_PORT:?}:3100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      data-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+      supervisor:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3100/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  worker:
+    image: ghcr.io/elie222/rakazo/app:latest
+    restart: unless-stopped
+    working_dir: /app/apps/worker
+    command: ["node", "--enable-source-maps", "dist/index.js"]
+    stop_grace_period: 50m
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATA_DIR: /data
+      WAKEUP_DRIVER: graphile
+      AGENT_RUNTIME: pi
+      SANDBOX_PROVIDER: docker
+      SANDBOX_SUPERVISOR_URL: http://supervisor:7091
+      CONTENT_ENCRYPTION: "on"
+      MAX_UPLOAD_SIZE_MB: "10"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/app:/data
+      - ./credentials:/credentials:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      data-init:
+        condition: service_completed_successfully
+      supervisor:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "dist/health-check.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 2m
+
+  web:
+    image: ghcr.io/elie222/rakazo/app:latest
+    restart: unless-stopped
+    working_dir: /app/apps/web
+    command: ["node_modules/.bin/vite", "preview", "--host", "0.0.0.0", "--port", "5173"]
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      API_PROXY_TARGET: http://api:3100
+    volumes:
+      - ./data/web-assets:/app/apps/web/asset-archive
+    ports:
+      - "127.0.0.1:${RAKAZO_WEB_PORT:?}:5173"
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy

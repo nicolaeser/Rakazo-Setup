@@ -1,0 +1,42 @@
+(rakazo_access_log) {
+	log {
+		output stdout
+		format filter {
+			wrap json
+			request>headers>Authorization delete
+			request>headers>Proxy-Authorization delete
+			request>headers>Cookie delete
+			request>headers>Referer delete
+			resp_headers>Set-Cookie delete
+			resp_headers>Location delete
+			request>uri regexp "(/reset-password/|/novnc/session/[a-z]+/|/api/v1/pages/shared/|^/p/)[^/?#&]*|([?&](?:token|_token|code|state|ticket|access_token|id_token|hub\.verify_token|path)=)[^&#]*" "${1}${2}REDACTED"
+		}
+	}
+}
+
+(rakazo_retry) {
+	lb_try_duration 10s
+	lb_try_interval 250ms
+}
+
+rakazo.example.com {
+	import rakazo_access_log
+	encode zstd gzip
+
+	header Strict-Transport-Security "max-age=31536000"
+	header X-Content-Type-Options nosniff
+
+	@api path /health /api/* /rpc/*
+	handle @api {
+		reverse_proxy 127.0.0.1:3100 {
+			import rakazo_retry
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:5173 {
+			import rakazo_retry
+		}
+	}
+}
