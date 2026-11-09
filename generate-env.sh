@@ -3,8 +3,9 @@
 #
 #   ./generate-env.sh           Create or update .env interactively. Existing secrets and custom
 #                               entries are kept, the previous file is backed up.
+#   ./generate-env.sh --owner   Create the admin account with a password (stack must be running)
 #   ./generate-env.sh --check   Check .env; with the stack running also health, host check,
-#                               computers, screen proxy, Caddy, TLS and CORS
+#                               accounts, computers, screen proxy, Caddy, TLS and CORS
 #
 # .env holds secrets, domain, ports and options. Everything else is fixed in docker-compose.yml
 # and takes precedence there.
@@ -242,7 +243,7 @@ step_email() {
   local mode def=1 key from smtp
   printf '\n== Email ==\n'
   printf 'For verification mails, password resets and sign-in codes. Without email there is no\n'
-  printf 'password recovery and no allowlist signup.\n'
+  printf 'password recovery, and an allowlist only works with SSO.\n'
   if [[ ${CUR[EMAIL_PROVIDER]:-} == resend ]]; then def=2
   elif [[ -n ${CUR[SMTP_URL]:-} || ${CUR[EMAIL_PROVIDER]:-} == smtp ]]; then def=3; fi
   choose mode "$def" "none" "Resend (HTTP API)" "SMTP (e.g. Amazon SES, Resend SMTP, your own server)"
@@ -275,22 +276,28 @@ step_email() {
 }
 
 step_signups() {
-  local mode def list e entries=()
+  local mode def list e entries=() first example=@company.com
   printf '\n== Signup ==\n'
+  printf 'Who may create an account on their own. There is no "closed except one domain": to admit only\n'
+  printf '@company.com, signup stays on with an allowlist. Admin accounts are created with a password\n'
+  printf 'via ./generate-env.sh --owner in every mode.\n'
   if [[ ${CUR[SIGNUPS_ENABLED]:-} == false ]]; then def=1
   elif [[ -n ${CUR[SIGNUP_ALLOWLIST]:-} ]]; then def=2
   elif [[ ${CUR[SIGNUPS_ENABLED]:-} == true ]]; then def=3
-  elif [[ -n ${NEW[EMAIL_PROVIDER]} ]]; then def=2
+  elif [[ -n ${NEW[EMAIL_PROVIDER]}${NEW[OIDC_ISSUER]} ]]; then def=2
   else def=1; fi
   while :; do
     choose mode "$def" \
-      "closed – accounts only via bootstrap-owner on the server (the right choice without email)" \
-      "allowlist – only listed addresses/domains, with a verification mail (needs email)" \
+      "closed – nobody can sign up, not even with SSO; accounts only via --owner" \
+      "allowlist – only listed addresses or domains, via SSO or verification mail (needs one of them)" \
       "open – anyone who reaches the domain can create an account"
-    if ((mode == 2)) && [[ -z ${NEW[EMAIL_PROVIDER]} ]]; then
-      warn "An allowlist needs email delivery, also for the first account. Without email nobody can sign up."
+    if ((mode == 2)) && [[ -z ${NEW[EMAIL_PROVIDER]}${NEW[OIDC_ISSUER]} ]]; then
+      warn "An allowlist needs email delivery or SSO. Without either nobody can sign up."
       def=1
       continue
+    fi
+    if ((mode == 2)) && [[ -z ${NEW[EMAIL_PROVIDER]} ]]; then
+      printf 'Without email only SSO sign-up works; the provider must send email_verified=true.\n'
     fi
     if ((mode == 3)) && ! ask_yn "Really open? Anyone with access to https://${NEW[RAKAZO_HOST]} can create an account" n; then
       continue
@@ -302,8 +309,10 @@ step_signups() {
   case $mode in
     1) NEW[SIGNUPS_ENABLED]=false ;;
     2)
+      first=${NEW[RAKAZO_ADMIN_EMAILS]%%,*}
+      [[ -n $first ]] && example=@${first#*@}
       while :; do
-        ask list "Allowlist, comma-separated (you@example.com, @company.com)" "${CUR[SIGNUP_ALLOWLIST]:-}"
+        ask list "Allowed addresses or domains, comma-separated (e.g. $example)" "${CUR[SIGNUP_ALLOWLIST]:-}"
         split_list "$list"
         entries=()
         for e in "${LIST[@]}"; do
@@ -321,8 +330,9 @@ step_signups() {
 
 step_admins() {
   local list e entries
-  printf '\n== Admin accounts (optional) ==\n'
-  printf 'May review plugin submissions and add stdio MCP servers; no other special rights.\n'
+  printf '\n== Admin accounts ==\n'
+  printf 'May review plugin submissions and add stdio MCP servers; no other special rights. After the\n'
+  printf 'start create the account with a password: ./generate-env.sh --owner (first address is the default).\n'
   while :; do
     ask list "Admin emails, comma-separated (empty = none)" "${CUR[RAKAZO_ADMIN_EMAILS]:-}"
     split_list "$list"
@@ -462,7 +472,9 @@ EOF
     cat <<'EOF'
 
 # --- Accounts -------------------------------------------------------------------------------------
-# An allowlist needs email delivery. With SIGNUPS_ENABLED=false create accounts via bootstrap-owner.
+# SIGNUPS_ENABLED=false: nobody can sign up, not even with SSO; create accounts with
+# ./generate-env.sh --owner. To admit only some addresses or domains keep signup on and set
+# SIGNUP_ALLOWLIST (you@example.com,@company.com); that needs email delivery or SSO.
 EOF
     env_line SIGNUPS_ENABLED
     env_line SIGNUP_ALLOWLIST
@@ -529,9 +541,9 @@ New values would not match (sign-in fails, stored credentials become unreadable)
   step_ports
   step_computers
   step_email
-  step_signups
-  step_admins
   step_sso
+  step_admins
+  step_signups
   step_catalog
   step_models
   step_secrets
@@ -583,17 +595,65 @@ Next steps
   5. Check:            ./generate-env.sh --check
 EOF
   if ((SIGNUP_MODE == 1)); then
-    cat <<'EOF'
-  6. Create the first account (password at least 16 characters, stays in the shell):
-       read -r -p "Email: " OWNER_EMAIL; read -r -s -p "Password: " OWNER_PASSWORD; echo
-       export OWNER_EMAIL OWNER_PASSWORD
-       docker compose exec -e OWNER_EMAIL -e OWNER_PASSWORD api node dist/cli/bootstrap-owner.js
-       unset OWNER_EMAIL OWNER_PASSWORD
-EOF
+    printf '  6. Create the first account with a password, the only way in while signup is closed:\n'
+  else
+    printf '  6. Create the admin account with a password:\n'
   fi
+  printf '       ./generate-env.sh --owner\n'
   if [[ -n ${NEW[OIDC_ISSUER]} ]]; then
     printf '\nSSO: redirect URI at the provider: https://%s/api/auth/callback/oidc\n' "${NEW[RAKAZO_HOST]}"
+    printf 'The provider must send the email address with email_verified=true. An account from --owner\n'
+    printf 'signs in with its password first and then chooses Link SSO in the account settings; SSO\n'
+    printf 'sign-in with the same address is refused until then.\n'
+    case $SIGNUP_MODE in
+      1) printf 'Signup is closed, so SSO cannot create new accounts.\n' ;;
+      2) printf 'Addresses on the allowlist (%s) can create their account with SSO directly.\n' "${NEW[SIGNUP_ALLOWLIST]}" ;;
+    esac
   fi
+}
+
+# --- Owner ---------------------------------------------------------------------------------------
+
+owner() {
+  local email pw pw2 res admins
+  [[ -t 0 ]] || die "Please run interactively in a terminal."
+  [[ -f $ENV_FILE ]] || die "No .env found. Run ./generate-env.sh first."
+  load_env
+  [[ -n $(docker compose ps -q --status running api 2>/dev/null) ]] ||
+    die "The api service is not running. Start the stack first: docker compose up -d"
+  admins=${CUR[RAKAZO_ADMIN_EMAILS]:-}
+  split_list "$admins"
+  printf 'Creates a verified account with a password, or verifies an existing one if the password\n'
+  printf 'matches. An account that is already verified stays unchanged.\n'
+  while :; do
+    ask email "Account email" "${LIST[0]:-}"
+    email=${email,,}
+    valid_email "$email" && break
+    warn "\"$email\" is not an email address."
+  done
+  while :; do
+    IFS= read -r -s -p "Password (at least 16 characters): " pw || die "Input aborted."
+    printf '\n'
+    ((${#pw} >= 16)) || { warn "The password needs at least 16 characters."; continue; }
+    IFS= read -r -s -p "Repeat the password: " pw2 || die "Input aborted."
+    printf '\n'
+    [[ $pw == "$pw2" ]] && break
+    warn "The passwords do not match."
+  done
+  if ! res=$(OWNER_EMAIL=$email OWNER_PASSWORD=$pw docker compose exec -T -e OWNER_EMAIL -e OWNER_PASSWORD \
+    api node dist/cli/bootstrap-owner.js 2>&1); then
+    printf '%s\n' "$res" | grep -v '^\s*at ' | sed 's/^/  /' >&2 || true
+    die "Account was not created."
+  fi
+  if [[ $res == *"Account verified"* ]]; then
+    printf '\nAccount %s is ready. Sign in at https://%s\n' "$email" "${CUR[RAKAZO_HOST]}"
+  else
+    printf '\n%s already had a verified account; it is unchanged, the password was not set.\n' "$email"
+  fi
+  [[ ,${admins// /}, == *,"$email",* ]] ||
+    printf 'Not in RAKAZO_ADMIN_EMAILS, so no admin rights; add it with ./generate-env.sh if wanted.\n'
+  [[ -z ${CUR[OIDC_ISSUER]:-} ]] ||
+    printf 'For SSO: sign in with the password, then choose Link SSO in the account settings.\n'
 }
 
 # --- Check ---------------------------------------------------------------------------------------
@@ -705,8 +765,19 @@ check() {
     bad "DATABASE_URL is not of the form postgres://rakazo_app:<password>@postgres:5432/rakazo"
   fi
 
-  if [[ -n ${CUR[SIGNUP_ALLOWLIST]:-} && -z ${CUR[EMAIL_PROVIDER]:-}${CUR[SMTP_URL]:-} ]]; then
-    bad "SIGNUP_ALLOWLIST is set but there is no email delivery: nobody can sign up"
+  if [[ -n ${CUR[SIGNUP_ALLOWLIST]:-} && ${CUR[SIGNUPS_ENABLED]:-} != false &&
+    -z ${CUR[EMAIL_PROVIDER]:-}${CUR[SMTP_URL]:-} ]]; then
+    if [[ -n ${CUR[OIDC_ISSUER]:-} ]]; then
+      hint "SIGNUP_ALLOWLIST without email delivery: only SSO sign-up works (provider must send email_verified=true)"
+    else
+      bad "SIGNUP_ALLOWLIST is set but there is no email delivery or SSO: nobody can sign up"
+    fi
+  fi
+  if [[ ${CUR[SIGNUPS_ENABLED]:-} == false && -n ${CUR[SIGNUP_ALLOWLIST]:-} ]]; then
+    hint "SIGNUP_ALLOWLIST has no effect while SIGNUPS_ENABLED=false; to admit only these addresses set SIGNUPS_ENABLED=true"
+  fi
+  if [[ ${CUR[SIGNUPS_ENABLED]:-} == false && -n ${CUR[OIDC_ISSUER]:-} ]]; then
+    hint "signup is closed, so SSO cannot create accounts: ./generate-env.sh --owner, then Link SSO in the account settings"
   fi
   if [[ -n ${CUR[OIDC_ISSUER]:-}${CUR[OIDC_CLIENT_ID]:-}${CUR[OIDC_CLIENT_SECRET]:-} ]]; then
     [[ -n ${CUR[OIDC_ISSUER]:-} && -n ${CUR[OIDC_CLIENT_ID]:-} && -n ${CUR[OIDC_CLIENT_SECRET]:-} ]] ||
@@ -770,6 +841,28 @@ check() {
         bad "app catalog $k is set in .env, but the API does not report it active (docker compose logs api)"
     done
 
+    printf '\nAccounts\n'
+    split_list "${CUR[RAKAZO_ADMIN_EMAILS]:-}"
+    for e in "${LIST[@]}"; do
+      if ! v=$(printf '%s\n' "SELECT \"emailVerified\" FROM \"user\" WHERE email = :'email';" |
+        docker compose exec -T postgres psql -U rakazo -d rakazo -tAq -v email="$e" 2>/dev/null); then
+        hint "accounts not readable from the database (docker compose logs postgres)"
+        break
+      fi
+      case $v in
+        t) ok "admin $e has a verified account" ;;
+        f) bad "admin $e is not verified, so no admin rights: ./generate-env.sh --owner with its password" ;;
+        *) [[ ${CUR[SIGNUPS_ENABLED]:-} == false ]] &&
+             bad "no account for admin $e yet: ./generate-env.sh --owner" ||
+             hint "no account for admin $e yet: ./generate-env.sh --owner" ;;
+      esac
+    done
+    if ((${#LIST[@]} == 0)); then
+      v=$(docker compose exec -T postgres psql -U rakazo -d rakazo -tAqc 'SELECT count(*) FROM "user"' 2>/dev/null || true)
+      [[ $v == 0 ]] && hint "no accounts yet: ./generate-env.sh --owner" || hint "no RAKAZO_ADMIN_EMAILS set"
+    fi
+
+    printf '\nCaddy\n'
     caddy_file=/etc/caddy/rakazo.caddy
     if [[ ! -r $caddy_file ]]; then
       hint "$caddy_file not found: get Caddyfile.example from $CADDY_EXAMPLE_URL"
@@ -848,10 +941,11 @@ check() {
   printf 'All good.\n'
 }
 
-usage() { sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case ${1-} in
   "") generate ;;
+  --owner) owner ;;
   --check) check ;;
   -h | --help) usage ;;
   *) die "Unknown option: $1 (see --help)" ;;
