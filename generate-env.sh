@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Rakazo – writes the .env for docker-compose.yml and the site block for Caddy on the host.
+# Rakazo – writes the .env for docker-compose.yml.
 #
 #   ./generate-env.sh           Create or update .env interactively. Existing secrets and custom
 #                               entries are kept, the previous file is backed up.
-#   ./generate-env.sh --caddy   Print the Caddy site block matching .env
 #   ./generate-env.sh --check   Check .env; with the stack running also health, host check,
-#                               computers, screen proxy, TLS and CORS
+#                               computers, screen proxy, Caddy, TLS and CORS
 #
 # .env holds secrets, domain, ports and options. Everything else is fixed in docker-compose.yml
 # and takes precedence there.
@@ -18,6 +17,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 ENV_FILE=.env
 DEFAULT_WEB_PORT=5173
 DEFAULT_API_PORT=3100
+CADDY_EXAMPLE_URL=https://github.com/nicolaeser/Rakazo-Setup/blob/main/Caddyfile.example
+CADDY_EXAMPLE_RAW=https://raw.githubusercontent.com/nicolaeser/Rakazo-Setup/main/Caddyfile.example
 
 # Managed by this script.
 MANAGED_KEYS=(
@@ -158,59 +159,6 @@ env_line() {
   else
     printf "%s='%s'\n" "$key" "$val"
   fi
-}
-
-# --- Caddy ---------------------------------------------------------------------------------------
-
-# print_caddy HOST WEB_PORT API_PORT
-print_caddy() {
-  local host=$1 web=127.0.0.1:$2 api=127.0.0.1:$3
-  cat <<'EOF'
-(rakazo_access_log) {
-	log {
-		output stdout
-		format filter {
-			wrap json
-			request>headers>Authorization delete
-			request>headers>Proxy-Authorization delete
-			request>headers>Cookie delete
-			request>headers>Referer delete
-			resp_headers>Set-Cookie delete
-			resp_headers>Location delete
-			request>uri regexp "(/reset-password/|/novnc/session/[a-z]+/|/api/v1/pages/shared/|^/p/)[^/?#&]*|([?&](?:token|_token|code|state|ticket|access_token|id_token|hub\.verify_token|path)=)[^&#]*" "${1}${2}REDACTED"
-		}
-	}
-}
-
-(rakazo_retry) {
-	lb_try_duration 10s
-	lb_try_interval 250ms
-}
-EOF
-  cat <<EOF
-
-$host {
-	import rakazo_access_log
-	encode zstd gzip
-
-	header Strict-Transport-Security "max-age=31536000"
-	header X-Content-Type-Options nosniff
-
-	@api path /health /api/* /rpc/*
-	handle @api {
-		reverse_proxy $api {
-			import rakazo_retry
-			header_up X-Forwarded-For {client_ip}
-		}
-	}
-
-	handle {
-		reverse_proxy $web {
-			import rakazo_retry
-		}
-	}
-}
-EOF
 }
 
 # --- Generate ------------------------------------------------------------------------------------
@@ -480,8 +428,8 @@ EOF
     cat <<'EOF'
 
 # --- Ports ----------------------------------------------------------------------------------------
-# Published on 127.0.0.1 only; Caddy forwards to them. After a change regenerate the Caddy block
-# (./generate-env.sh --caddy), reload Caddy and run docker compose up -d.
+# Published on 127.0.0.1 only; Caddy forwards to them. After a change update the ports in
+# /etc/caddy/rakazo.caddy, reload Caddy and run docker compose up -d.
 EOF
     env_line RAKAZO_WEB_PORT
     env_line RAKAZO_API_PORT
@@ -561,7 +509,7 @@ EOF
 }
 
 generate() {
-  local k
+  local k caddy_note caddy_sed
   command -v openssl >/dev/null || die "openssl is missing."
   [[ -t 0 ]] || die "Please run interactively in a terminal."
   load_env
@@ -601,8 +549,15 @@ New values would not match (sign-in fails, stored credentials become unreadable)
   printf '  Ports:         web 127.0.0.1:%s, API 127.0.0.1:%s\n' "${NEW[RAKAZO_WEB_PORT]}" "${NEW[RAKAZO_API_PORT]}"
   printf '  SSO:           %s\n' "${NEW[OIDC_ISSUER]:-off}"
   printf '  App catalog:   %s\n' "$(case $CATALOG_MODE in 1) echo none ;; 2) echo Composio ;; 3) echo "Pipedream (${NEW[PIPEDREAM_ENVIRONMENT]})" ;; esac)"
+  caddy_note=. caddy_sed="-e 's/rakazo\\.example\\.com/${NEW[RAKAZO_HOST]}/'"
+  if [[ ${NEW[RAKAZO_WEB_PORT]} != "$DEFAULT_WEB_PORT" || ${NEW[RAKAZO_API_PORT]} != "$DEFAULT_API_PORT" ]]; then
+    caddy_note=",
+     the web port $DEFAULT_WEB_PORT with ${NEW[RAKAZO_WEB_PORT]} and the API port $DEFAULT_API_PORT with ${NEW[RAKAZO_API_PORT]}."
+    caddy_sed+=" -e 's/127\\.0\\.0\\.1:$DEFAULT_WEB_PORT /127.0.0.1:${NEW[RAKAZO_WEB_PORT]} /'"
+    caddy_sed+=" -e 's/127\\.0\\.0\\.1:$DEFAULT_API_PORT /127.0.0.1:${NEW[RAKAZO_API_PORT]} /'"
+  fi
   if ((PORTS_CHANGED)); then
-    warn "Ports changed: regenerate the Caddy block and reload Caddy (step 2), otherwise the domain answers 502."
+    warn "Ports changed: update the ports in /etc/caddy/rakazo.caddy and reload Caddy, otherwise the domain answers 502."
   fi
 
   cat <<EOF
@@ -610,8 +565,11 @@ New values would not match (sign-in fails, stored credentials become unreadable)
 Next steps
   1. DNS: A/AAAA record for ${NEW[RAKAZO_HOST]} pointing to this host.
      Ports 80/tcp and 443/tcp open (443/udp for HTTP/3).
-  2. Caddy on the host:
-       ./generate-env.sh --caddy | sudo tee /etc/caddy/rakazo.caddy >/dev/null
+  2. Caddy on the host: get Caddyfile.example from GitHub, save it as /etc/caddy/rakazo.caddy
+     and replace rakazo.example.com with ${NEW[RAKAZO_HOST]}${caddy_note}
+       ${CADDY_EXAMPLE_URL}
+       sudo curl -fsSLo /etc/caddy/rakazo.caddy ${CADDY_EXAMPLE_RAW}
+       sudo sed -i ${caddy_sed} /etc/caddy/rakazo.caddy
        once in /etc/caddy/Caddyfile:  import /etc/caddy/rakazo.caddy
        sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
   3. Recommended, once per host: keep computers away from the host, the LAN and cloud metadata
@@ -813,12 +771,16 @@ check() {
     done
 
     caddy_file=/etc/caddy/rakazo.caddy
-    if [[ -r $caddy_file ]]; then
-      if grep -q "reverse_proxy $web " "$caddy_file" && grep -q "reverse_proxy $api " "$caddy_file"; then
-        ok "$caddy_file points to $web and $api"
-      else
-        bad "$caddy_file does not point to $web/$api: reinstall ./generate-env.sh --caddy, reload Caddy"
-      fi
+    if [[ ! -r $caddy_file ]]; then
+      hint "$caddy_file not found: get Caddyfile.example from $CADDY_EXAMPLE_URL"
+    elif grep -qF rakazo.example.com "$caddy_file"; then
+      bad "$caddy_file still contains rakazo.example.com: replace it with $host, reload Caddy"
+    elif ! grep -qF "$host {" "$caddy_file"; then
+      bad "$caddy_file has no site block for $host: replace the domain there, reload Caddy"
+    elif grep -q "reverse_proxy $web " "$caddy_file" && grep -q "reverse_proxy $api " "$caddy_file"; then
+      ok "$caddy_file serves $host and points to $web and $api"
+    else
+      bad "$caddy_file does not point to $web/$api: fix the reverse_proxy ports there, reload Caddy"
     fi
 
     printf '\nComputers\n'
@@ -864,7 +826,7 @@ check() {
       if [[ $code == 200 ]]; then
         ok "$origin/health through Caddy"
         grep -qi '^strict-transport-security:' <<<"$res" && ok "HSTS set" ||
-          hint "no Strict-Transport-Security header (using the block from --caddy?)"
+          hint "no Strict-Transport-Security header (using Caddyfile.example?)"
         code=$(http_probe "$origin/")
         [[ ${code: -3} == 200 ]] && ok "$origin/ (web)" || bad "$origin/ answers ${code: -3}"
         check_cors "$origin" "$origin" "Caddy"
@@ -886,16 +848,10 @@ check() {
   printf 'All good.\n'
 }
 
-usage() { sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case ${1-} in
   "") generate ;;
-  --caddy)
-    load_env
-    [[ -n ${CUR[RAKAZO_HOST]:-} && -n ${CUR[RAKAZO_WEB_PORT]:-} && -n ${CUR[RAKAZO_API_PORT]:-} ]] ||
-      die "RAKAZO_HOST or the ports are missing in .env. Run ./generate-env.sh first."
-    print_caddy "${CUR[RAKAZO_HOST]}" "${CUR[RAKAZO_WEB_PORT]}" "${CUR[RAKAZO_API_PORT]}"
-    ;;
   --check) check ;;
   -h | --help) usage ;;
   *) die "Unknown option: $1 (see --help)" ;;
