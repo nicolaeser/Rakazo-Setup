@@ -4,6 +4,11 @@ services:
   postgres:
     image: postgres:16
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
     env_file:
       - .env
     environment:
@@ -18,21 +23,36 @@ services:
       retries: 20
 
   computer:
-    image: ghcr.io/elie222/rakazo/computer:latest
+    image: ghcr.io/elie222/rakazo/computer:${RAKAZO_IMAGE_TAG:?}
     command: ["true"]
     restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
 
   data-init:
     image: busybox:latest
     command: ["find", "/data", "/web-assets", "!", "(", "-user", "1000", "-group", "1000", ")", "-exec", "chown", "-h", "1000:1000", "{}", "+"]
     restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
     volumes:
       - ./data/app:/data
       - ./data/web-assets:/web-assets
 
   supervisor:
-    image: ghcr.io/elie222/rakazo/app:latest
+    image: ghcr.io/elie222/rakazo/app:${RAKAZO_IMAGE_TAG:?}
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
     command: ["pnpm", "--filter", "@rakazo/sandbox-supervisor", "start"]
     user: root
     env_file:
@@ -44,7 +64,7 @@ services:
       SUPERVISOR_PORT: "7091"
       DOCKER_SOCKET: /var/run/docker.sock
       MAX_UPLOAD_SIZE_MB: "10"
-      RAKAZO_COMPUTER_IMAGE: ghcr.io/elie222/rakazo/computer:latest
+      RAKAZO_COMPUTER_IMAGE: ghcr.io/elie222/rakazo/computer:${RAKAZO_IMAGE_TAG:?}
       RAKAZO_COMPUTER_MEMORY: 2g
       RAKAZO_COMPUTER_CPUS: "2"
       RAKAZO_COMPUTER_PIDS_LIMIT: "2048"
@@ -71,10 +91,15 @@ services:
       retries: 20
 
   migrate:
-    image: ghcr.io/elie222/rakazo/app:latest
+    image: ghcr.io/elie222/rakazo/app:${RAKAZO_IMAGE_TAG:?}
     working_dir: /app/apps/api
     command: ["pnpm", "db:deploy"]
     restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
     env_file:
       - .env
     depends_on:
@@ -82,8 +107,13 @@ services:
         condition: service_healthy
 
   api:
-    image: ghcr.io/elie222/rakazo/app:latest
+    image: ghcr.io/elie222/rakazo/app:${RAKAZO_IMAGE_TAG:?}
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
     working_dir: /app/apps/api
     command: ["node", "--enable-source-maps", "dist/index.js"]
     env_file:
@@ -126,8 +156,13 @@ services:
       retries: 20
 
   worker:
-    image: ghcr.io/elie222/rakazo/app:latest
+    image: ghcr.io/elie222/rakazo/app:${RAKAZO_IMAGE_TAG:?}
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
     working_dir: /app/apps/worker
     command: ["node", "--enable-source-maps", "dist/index.js"]
     stop_grace_period: 50m
@@ -164,8 +199,13 @@ services:
       start_period: 2m
 
   web:
-    image: ghcr.io/elie222/rakazo/app:latest
+    image: ghcr.io/elie222/rakazo/app:${RAKAZO_IMAGE_TAG:?}
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
     working_dir: /app/apps/web
     command: ["node_modules/.bin/vite", "preview", "--host", "0.0.0.0", "--port", "5173"]
     env_file:

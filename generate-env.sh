@@ -31,14 +31,16 @@ MANAGED_KEYS=(
   EMAIL_PROVIDER EMAIL_API_KEY SMTP_URL EMAIL_FROM
   OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET OIDC_NAME OIDC_ALLOW_SIGNUP_BYPASS
   COMPOSIO_API_KEY PIPEDREAM_CLIENT_ID PIPEDREAM_CLIENT_SECRET PIPEDREAM_PROJECT_ID PIPEDREAM_ENVIRONMENT
-  OPENROUTER_API_KEY
+  PI_DEFAULT_PROVIDER PI_DEFAULT_MODEL PI_DEFAULT_CREDENTIALS OPENROUTER_API_KEY ANTHROPIC_API_KEY
+  DEEPSEEK_API_KEY RAKAZO_LOCAL_MODELS_URL RAKAZO_LOCAL_MODELS RAKAZO_LOCAL_VISION_MODELS
+  RAKAZO_LOCAL_CONTEXT_WINDOW RAKAZO_LOCAL_MAX_TOKENS RAKAZO_IMAGE_TAG
 )
 # No effect in .env: fixed in docker-compose.yml or left over from the upstream setup.
 FIXED_KEYS=(
   NODE_ENV DATA_DIR WAKEUP_DRIVER AGENT_RUNTIME SANDBOX_PROVIDER SANDBOX_SUPERVISOR_URL
   CONTENT_ENCRYPTION MAX_UPLOAD_SIZE_MB API_HOST API_PORT POSTGRES_USER POSTGRES_DB
   POSTGRES_APP_PASSWORD COMPOSE_PROFILES RAKAZO_DATA_DIR RAKAZO_CREDENTIALS_DIR
-  RAKAZO_IMAGE RAKAZO_IMAGE_TAG RAKAZO_COMPUTER_IMAGE RAKAZO_COMPUTER_IMAGE_TAG
+  RAKAZO_IMAGE RAKAZO_COMPUTER_IMAGE RAKAZO_COMPUTER_IMAGE_TAG
   POSTGRES_IMAGE BUSYBOX_IMAGE CADDY_IMAGE CADDYFILE_PATH CADDY_HTTP_PORT CADDY_HTTPS_PORT
   RAKAZO_WEB_BIND DOCKER_SOCKET_PATH
 )
@@ -181,6 +183,24 @@ pool_capacity() {
   ((n == 0)) || printf '%s' "$n"
 }
 
+# deployment_model CUR|NEW → "provider (model)" or "none (…)", as the API resolves it
+deployment_model() {
+  local -n m=$1
+  local provider=${m[PI_DEFAULT_PROVIDER]:-openrouter} key
+  case $provider in
+    openrouter) key=${m[OPENROUTER_API_KEY]:-} ;;
+    anthropic) key=${m[ANTHROPIC_API_KEY]:-} ;;
+    deepseek) key=${m[DEEPSEEK_API_KEY]:-} ;;
+    local)
+      [[ ${m[PI_DEFAULT_CREDENTIALS]:-} == host && ,${m[RAKAZO_LOCAL_MODELS]:-}, == *,"${m[PI_DEFAULT_MODEL]:-}",* &&
+        -n ${m[PI_DEFAULT_MODEL]:-} ]] && key=host || key=""
+      ;;
+    *) key=custom ;;
+  esac
+  if [[ -z $key ]]; then printf 'none (every account connects its own model)'
+  else printf '%s (%s)' "$provider" "${m[PI_DEFAULT_MODEL]:-default model}"; fi
+}
+
 keep_or_new() { if [[ -n $1 ]]; then printf '%s' "$1"; else openssl rand -hex "$2"; fi; }
 
 step_domain() {
@@ -235,10 +255,30 @@ step_ports() {
   fi
 }
 
+step_images() {
+  local mode def=1 old=${CUR[RAKAZO_IMAGE_TAG]:-}
+  local opts=("latest – the newest release (recommended)" "edge – the current development state of main, untested")
+  printf '\n== Release channel ==\n'
+  printf 'edge gets every change first. Database migrations cannot be undone: going back from edge to\n'
+  printf 'latest is only safe once a release has caught up with the edge you ran.\n'
+  [[ $old == edge ]] && def=2
+  if [[ -n $old && $old != latest && $old != edge ]]; then
+    opts+=("keep $old")
+    def=3
+  fi
+  choose mode "$def" "${opts[@]}"
+  case $mode in 1) NEW[RAKAZO_IMAGE_TAG]=latest ;; 2) NEW[RAKAZO_IMAGE_TAG]=edge ;; 3) NEW[RAKAZO_IMAGE_TAG]=$old ;; esac
+  if [[ $old == edge && ${NEW[RAKAZO_IMAGE_TAG]} == latest ]] && pg_data_exists; then
+    warn "The database already has edge's migrations; latest may refuse to start until it catches up."
+    ask_yn "Switch to latest anyway" n || NEW[RAKAZO_IMAGE_TAG]=edge
+  fi
+}
+
 step_computers() {
   local def=y
   printf '\n== Computers ==\n'
-  printf 'Every bot gets its own Docker container with a desktop and browser (up to 2 GB RAM, 2 CPUs each).\n'
+  printf 'Every Private bot and every space gets a Docker container with a desktop and browser (up to\n'
+  printf '2 GB RAM, 2 CPUs each); Team bots get their own screen in the space'"'"'s container.\n'
   printf 'By default Rakazo stops it after 10 minutes idle. For Docker the docs recommend keeping it\n'
   printf 'running so started apps and sessions stay open. That costs RAM, and every running computer\n'
   printf 'holds its own Docker network (the default address pools allow a few dozen).\n'
@@ -435,11 +475,84 @@ step_catalog() {
 }
 
 step_models() {
-  local key
-  printf '\n== Models (optional) ==\n'
-  printf 'Models can also be connected in the app after signing in.\n'
-  ask_secret key "OpenRouter API key (empty = none)" "${CUR[OPENROUTER_API_KEY]:-}"
-  NEW[OPENROUTER_API_KEY]=$key
+  local mode def=1 provider label var dm key model k old_provider=${CUR[PI_DEFAULT_PROVIDER]:-openrouter}
+  local opts=("none – every account connects its own model" "OpenRouter" "Anthropic" "DeepSeek"
+    "OpenAI-compatible server (vLLM, Ollama, LM Studio, llama.cpp, LiteLLM …)")
+  printf '\n== Deployment model ==\n'
+  printf 'Used by every account that has not connected a model of its own; all usage is billed to\n'
+  printf 'this key. Without it every new account, SSO included, has to connect its own model provider\n'
+  printf 'before the first chat. Pick a vision-capable model so the screen tools stay available.\n'
+  case $old_provider in
+    openrouter) [[ -n ${CUR[OPENROUTER_API_KEY]:-} ]] && def=2 ;;
+    anthropic) [[ -n ${CUR[ANTHROPIC_API_KEY]:-} ]] && def=3 ;;
+    deepseek) [[ -n ${CUR[DEEPSEEK_API_KEY]:-} ]] && def=4 ;;
+    local) def=5 ;;
+    *) opts+=("keep $old_provider (set by hand)"); def=6 ;;
+  esac
+  choose mode "$def" "${opts[@]}"
+  for k in PI_DEFAULT_PROVIDER PI_DEFAULT_MODEL PI_DEFAULT_CREDENTIALS OPENROUTER_API_KEY ANTHROPIC_API_KEY \
+    DEEPSEEK_API_KEY RAKAZO_LOCAL_MODELS_URL RAKAZO_LOCAL_MODELS RAKAZO_LOCAL_VISION_MODELS \
+    RAKAZO_LOCAL_CONTEXT_WINDOW RAKAZO_LOCAL_MAX_TOKENS; do
+    NEW[$k]=${CUR[$k]:-}
+  done
+  ((mode == 6)) && return 0
+  NEW[PI_DEFAULT_PROVIDER]="" NEW[PI_DEFAULT_MODEL]="" NEW[PI_DEFAULT_CREDENTIALS]=""
+  case $mode in
+    2) provider=openrouter label=OpenRouter var=OPENROUTER_API_KEY dm=openai/gpt-6-luna ;;
+    3) provider=anthropic label=Anthropic var=ANTHROPIC_API_KEY dm=claude-sonnet-5 ;;
+    4) provider=deepseek label=DeepSeek var=DEEPSEEK_API_KEY dm=deepseek-flash ;;
+    5) step_local_model; return 0 ;;
+    *)
+      # An OpenRouter key alone already makes OpenRouter the deployment model.
+      NEW[OPENROUTER_API_KEY]=""
+      return 0
+      ;;
+  esac
+  while :; do ask_secret key "$label API key" "${CUR[$var]:-}"; [[ -n $key ]] && break; done
+  [[ $provider == "$old_provider" ]] && model=${CUR[PI_DEFAULT_MODEL]:-} || model=""
+  ask model "Model (empty = Rakazo default, currently $dm)" "$model"
+  NEW[$var]=$key NEW[PI_DEFAULT_MODEL]=$model
+  [[ $provider == openrouter ]] || NEW[PI_DEFAULT_PROVIDER]=$provider
+}
+
+step_local_model() {
+  local url ids vision model ctx max e
+  printf 'API and worker must reach the server: a LAN IP, or http://host.docker.internal:<port>/v1 for a\n'
+  printf 'server on this host that listens on more than 127.0.0.1. Rakazo sends the API key "local"; a\n'
+  printf 'server that needs a real key must accept that or sit behind a proxy that adds it.\n'
+  while :; do
+    ask url "Base URL (e.g. http://10.0.0.5:8000/v1)" "${CUR[RAKAZO_LOCAL_MODELS_URL]:-}"
+    [[ $url =~ ^https?://[^/?#[:space:]]+(/[^?#[:space:]]*)?$ ]] && break
+    warn "The base URL must be an http(s) URL without query or fragment."
+  done
+  while :; do
+    ask ids "Model IDs on the server, comma-separated" "${CUR[RAKAZO_LOCAL_MODELS]:-}"
+    split_list "$ids"
+    ((${#LIST[@]})) && break
+  done
+  ids=$(join "${LIST[@]}")
+  [[ ,$ids, == *,"${CUR[PI_DEFAULT_MODEL]:-}",* ]] && model=${CUR[PI_DEFAULT_MODEL]} || model=${LIST[0]}
+  while :; do
+    ask model "Deployment model (one of $ids)" "$model"
+    [[ ,$ids, == *,"$model",* ]] && break
+    warn "\"$model\" is not in the list."
+  done
+  ask vision "Models that accept images, comma-separated (empty = none)" "${CUR[RAKAZO_LOCAL_VISION_MODELS]:-}"
+  split_list "$vision"
+  vision=$(join "${LIST[@]}")
+  [[ ,$vision, == *,"$model",* ]] ||
+    warn "$model is not marked as accepting images: the screen tools of the computers are unavailable."
+  for e in ctx max; do
+    while :; do
+      if [[ $e == ctx ]]; then ask ctx "Context window in tokens" "${CUR[RAKAZO_LOCAL_CONTEXT_WINDOW]:-32768}"
+      else ask max "Max output tokens per request" "${CUR[RAKAZO_LOCAL_MAX_TOKENS]:-4096}"; fi
+      [[ ${!e} =~ ^[1-9][0-9]*$ ]] && break
+      warn "Enter a positive whole number."
+    done
+  done
+  NEW[RAKAZO_LOCAL_MODELS_URL]=$url NEW[RAKAZO_LOCAL_MODELS]=$ids NEW[RAKAZO_LOCAL_VISION_MODELS]=$vision
+  NEW[RAKAZO_LOCAL_CONTEXT_WINDOW]=$ctx NEW[RAKAZO_LOCAL_MAX_TOKENS]=$max
+  NEW[PI_DEFAULT_PROVIDER]=local NEW[PI_DEFAULT_MODEL]=$model NEW[PI_DEFAULT_CREDENTIALS]=host
 }
 
 step_secrets() {
@@ -481,6 +594,13 @@ EOF
 EOF
     env_line RAKAZO_WEB_PORT
     env_line RAKAZO_API_PORT
+    cat <<'EOF'
+
+# --- Images ---------------------------------------------------------------------------------------
+# latest = newest release, edge = development state of main. Apply a change or an update with
+# docker compose pull && docker compose up -d
+EOF
+    env_line RAKAZO_IMAGE_TAG
     cat <<'EOF'
 
 # --- Computers ------------------------------------------------------------------------------------
@@ -537,8 +657,22 @@ EOF
     env_line PIPEDREAM_CLIENT_SECRET
     env_line PIPEDREAM_PROJECT_ID
     env_line PIPEDREAM_ENVIRONMENT
-    printf '\n# --- Models (optional) ----------------------------------------------------------------------------\n'
+    printf '\n# --- Deployment model -----------------------------------------------------------------------------\n'
+    printf '# Used by every account without a model of its own. PI_DEFAULT_PROVIDER empty = openrouter;\n'
+    printf '# PI_DEFAULT_MODEL empty = the provider default. Without the key of that provider every new\n'
+    printf '# account has to connect its own model.\n'
+    env_line PI_DEFAULT_PROVIDER
+    env_line PI_DEFAULT_MODEL
+    env_line PI_DEFAULT_CREDENTIALS
     env_line OPENROUTER_API_KEY
+    env_line ANTHROPIC_API_KEY
+    env_line DEEPSEEK_API_KEY
+    printf '# OpenAI-compatible server: PI_DEFAULT_PROVIDER=local, PI_DEFAULT_CREDENTIALS=host and these.\n'
+    env_line RAKAZO_LOCAL_MODELS_URL
+    env_line RAKAZO_LOCAL_MODELS
+    env_line RAKAZO_LOCAL_VISION_MODELS
+    env_line RAKAZO_LOCAL_CONTEXT_WINDOW
+    env_line RAKAZO_LOCAL_MAX_TOKENS
     cat <<'EOF'
 
 # --- Custom entries -------------------------------------------------------------------------------
@@ -579,6 +713,7 @@ New values would not match (sign-in fails, stored credentials become unreadable)
 
   step_domain
   step_ports
+  step_images
   step_computers
   step_email
   step_sso
@@ -599,7 +734,9 @@ New values would not match (sign-in fails, stored credentials become unreadable)
   printf '  Email:         %s\n' "${NEW[EMAIL_PROVIDER]:-none}"
   printf '  Signup:        %s\n' "$(case $SIGNUP_MODE in 1) echo closed ;; 2) echo "allowlist (${NEW[SIGNUP_ALLOWLIST]})" ;; 3) echo open ;; esac)"
   printf '  Ports:         web 127.0.0.1:%s, API 127.0.0.1:%s\n' "${NEW[RAKAZO_WEB_PORT]}" "${NEW[RAKAZO_API_PORT]}"
+  printf '  Images:        %s\n' "${NEW[RAKAZO_IMAGE_TAG]}"
   printf '  SSO:           %s\n' "${NEW[OIDC_ISSUER]:-off}"
+  printf '  Model:         %s\n' "$(deployment_model NEW)"
   printf '  App catalog:   %s\n' "$(case $CATALOG_MODE in 1) echo none ;; 2) echo Composio ;; 3) echo "Pipedream (${NEW[PIPEDREAM_ENVIRONMENT]})" ;; esac)"
   caddy_note=. caddy_sed="-e 's/rakazo\\.example\\.com/${NEW[RAKAZO_HOST]}/'"
   if [[ ${NEW[RAKAZO_WEB_PORT]} != "$DEFAULT_WEB_PORT" || ${NEW[RAKAZO_API_PORT]} != "$DEFAULT_API_PORT" ]]; then
@@ -607,6 +744,9 @@ New values would not match (sign-in fails, stored credentials become unreadable)
      the web port $DEFAULT_WEB_PORT with ${NEW[RAKAZO_WEB_PORT]} and the API port $DEFAULT_API_PORT with ${NEW[RAKAZO_API_PORT]}."
     caddy_sed+=" -e 's/127\\.0\\.0\\.1:$DEFAULT_WEB_PORT /127.0.0.1:${NEW[RAKAZO_WEB_PORT]} /'"
     caddy_sed+=" -e 's/127\\.0\\.0\\.1:$DEFAULT_API_PORT /127.0.0.1:${NEW[RAKAZO_API_PORT]} /'"
+  fi
+  if [[ -n ${CUR[RAKAZO_IMAGE_TAG]:-} && ${CUR[RAKAZO_IMAGE_TAG]} != "${NEW[RAKAZO_IMAGE_TAG]}" ]]; then
+    warn "Images change to ${NEW[RAKAZO_IMAGE_TAG]}: docker compose pull && docker compose up -d"
   fi
   if ((PORTS_CHANGED)); then
     warn "Ports changed: update the ports in /etc/caddy/rakazo.caddy and reload Caddy, otherwise the domain answers 502."
@@ -625,19 +765,21 @@ Next steps
        once in /etc/caddy/Caddyfile:  import /etc/caddy/rakazo.caddy
        sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
 EOF
-  cap=$(pool_capacity)
-  if [[ -n $cap ]]; then
-    printf '  3. Docker address pools are configured: room for %s networks.\n' "$cap"
-  else
-    cat <<'EOF'
-  3. Recommended, once per host, for more than about 20 computers: every Private bot and every
-     space gets its own computer with its own Docker network, and Docker's built-in address pools
-     hold only about 30 networks. In /etc/docker/daemon.json (if the file exists add only the key;
-     the range must not overlap your LAN, VPN or cloud network, see ip route):
-       { "default-address-pools": [{ "base": "10.200.0.0/16", "size": 24 }] }
+  cat <<'EOF'
+  3. Recommended, once per host: /etc/docker/daemon.json (if the file exists, add only the keys).
+     Address pools: every Private bot and every space gets its own Docker network, the built-in
+     pools hold only about 30; the range must not overlap your LAN, VPN or cloud network (ip route).
+     Log rotation: the stack rotates its logs via docker-compose.yml, but bot computers are created
+     by the supervisor and use the daemon's settings (applies to computers created afterwards).
+       {
+         "default-address-pools": [{ "base": "10.200.0.0/16", "size": 24 }],
+         "log-driver": "json-file",
+         "log-opts": { "max-size": "5m", "max-file": "3" }
+       }
        sudo dockerd --validate --config-file /etc/docker/daemon.json && sudo systemctl restart docker
 EOF
-  fi
+  cap=$(pool_capacity)
+  [[ -z $cap ]] || printf '     Address pools are already configured here: room for %s networks.\n' "$cap"
   cat <<EOF
   4. Recommended, once per host: keep computers away from the host, the LAN and cloud metadata
      (169.254.169.254). Without these firewall rules computers have open network access. Linux with
@@ -647,6 +789,7 @@ EOF
        sudo bash /tmp/restrict-computer-egress.sh
      If the stack is already running: docker compose up -d --force-recreate supervisor
   5. Start the stack:  docker compose up -d
+     Updates later:    docker compose pull && docker compose up -d
   6. Check:            ./generate-env.sh --check
 EOF
   if ((SIGNUP_MODE == 1)); then
@@ -765,6 +908,8 @@ health_has() {
 
 # Pings the Docker daemon from inside the supervisor, over the same socket it uses for computers.
 DOCKER_PING_JS="require('http').get({socketPath:'/var/run/docker.sock',path:'/_ping'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+# Lists the models of the OpenAI-compatible server the way the API reaches it.
+LOCAL_MODELS_JS="fetch(process.env.RAKAZO_LOCAL_MODELS_URL.replace(/\\/\$/,'')+'/models',{headers:{authorization:'Bearer local'},signal:AbortSignal.timeout(5000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 # Asks the screen proxy in the web container about an invalid capability, which it has the API
 # verify: 403 with its own message means /novnc/ reaches the proxy and the proxy reaches the API.
@@ -793,7 +938,7 @@ check() {
   printf '.env\n'
   [[ $(stat -c %a "$ENV_FILE" 2>/dev/null || echo 600) == 600 ]] ||
     hint ".env is not mode 600: chmod 600 .env"
-  for k in RAKAZO_HOST WEB_ORIGIN BETTER_AUTH_URL API_URL RAKAZO_WEB_PORT RAKAZO_API_PORT \
+  for k in RAKAZO_HOST WEB_ORIGIN BETTER_AUTH_URL API_URL RAKAZO_WEB_PORT RAKAZO_API_PORT RAKAZO_IMAGE_TAG \
     POSTGRES_PASSWORD DATABASE_URL DATABASE_MIGRATION_URL "${SECRET_KEYS[@]}"; do
     [[ -n ${CUR[$k]:-} ]] || bad "$k is missing or empty"
   done
@@ -873,6 +1018,26 @@ check() {
     [[ ${CUR[PIPEDREAM_ENVIRONMENT]:-} == production ]] ||
       hint "PIPEDREAM_ENVIRONMENT is not production: Rakazo uses Pipedream's development environment"
   fi
+  case ${CUR[RAKAZO_IMAGE_TAG]:-} in
+    "" | latest) ;;
+    edge) hint "images on edge: the development state of main, untested" ;;
+    *) [[ ${CUR[RAKAZO_IMAGE_TAG]} =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
+         bad "RAKAZO_IMAGE_TAG \"${CUR[RAKAZO_IMAGE_TAG]}\" is not a valid image tag" ;;
+  esac
+  if [[ ${CUR[PI_DEFAULT_PROVIDER]:-} == local ]]; then
+    [[ ${CUR[PI_DEFAULT_CREDENTIALS]:-} == host ]] ||
+      bad "PI_DEFAULT_PROVIDER=local needs PI_DEFAULT_CREDENTIALS=host"
+    [[ -n ${CUR[PI_DEFAULT_MODEL]:-} && ,${CUR[RAKAZO_LOCAL_MODELS]:-}, == *,"${CUR[PI_DEFAULT_MODEL]:-}",* ]] ||
+      bad "PI_DEFAULT_MODEL must be one of RAKAZO_LOCAL_MODELS"
+    [[ ${CUR[RAKAZO_LOCAL_MODELS_URL]:-} =~ ^https?:// ]] ||
+      bad "RAKAZO_LOCAL_MODELS_URL must be an http(s) URL"
+  fi
+  v=$(deployment_model CUR)
+  if [[ $v == none* ]]; then
+    hint "no deployment model: every new account has to connect its own model provider (./generate-env.sh)"
+  else
+    ok "deployment model: $v"
+  fi
   if [[ -z ${CUR[COMPOSIO_API_KEY]:-}${CUR[PIPEDREAM_CLIENT_ID]:-} ]]; then
     hint "no app catalog (Composio/Pipedream): Integrations → Apps stays empty, own MCP/OpenAPI work"
   fi
@@ -923,6 +1088,14 @@ check() {
       health_has "$res" "$k" && ok "app catalog $k is active" ||
         bad "app catalog $k is set in .env, but the API does not report it active (docker compose logs api)"
     done
+
+    if [[ ${CUR[PI_DEFAULT_PROVIDER]:-} == local ]]; then
+      if docker compose exec -T api node -e "$LOCAL_MODELS_JS" >/dev/null 2>&1; then
+        ok "API reaches the model server ${CUR[RAKAZO_LOCAL_MODELS_URL]:-}"
+      else
+        bad "API cannot list ${CUR[RAKAZO_LOCAL_MODELS_URL]:-}/models (address from inside a container? server bound to 127.0.0.1 only?)"
+      fi
+    fi
 
     printf '\nAccounts\n'
     split_list "${CUR[RAKAZO_ADMIN_EMAILS]:-}"
