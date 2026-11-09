@@ -29,7 +29,7 @@ MANAGED_KEYS=(
   BETTER_AUTH_SECRET ENCRYPTION_KEY SCREEN_PROXY_SECRET SANDBOX_SUPERVISOR_TOKEN
   SIGNUPS_ENABLED SIGNUP_ALLOWLIST RAKAZO_ADMIN_EMAILS
   EMAIL_PROVIDER EMAIL_API_KEY SMTP_URL EMAIL_FROM
-  OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET OIDC_NAME
+  OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET OIDC_NAME OIDC_ALLOW_SIGNUP_BYPASS
   COMPOSIO_API_KEY PIPEDREAM_CLIENT_ID PIPEDREAM_CLIENT_SECRET PIPEDREAM_PROJECT_ID PIPEDREAM_ENVIRONMENT
   OPENROUTER_API_KEY
 )
@@ -296,8 +296,15 @@ step_signups() {
       def=1
       continue
     fi
-    if ((mode == 2)) && [[ -z ${NEW[EMAIL_PROVIDER]} ]]; then
+    if ((mode == 2)) && [[ -n ${NEW[OIDC_ALLOW_SIGNUP_BYPASS]} ]]; then
+      printf 'SSO sign-up skips the allowlist (provider without email_verified). It still limits password\n'
+      printf 'sign-up, which also needs email.\n'
+    elif ((mode == 2)) && [[ -z ${NEW[EMAIL_PROVIDER]} ]]; then
       printf 'Without email only SSO sign-up works; the provider must send email_verified=true.\n'
+    fi
+    if ((mode == 1)) && [[ -n ${NEW[OIDC_ALLOW_SIGNUP_BYPASS]} ]]; then
+      warn "Closed signup with a provider without email_verified: SSO cannot be used at all."
+      ask_yn "Keep signup closed anyway" n || { def=2; continue; }
     fi
     if ((mode == 3)) && ! ask_yn "Really open? Anyone with access to https://${NEW[RAKAZO_HOST]} can create an account" n; then
       continue
@@ -347,22 +354,43 @@ step_admins() {
   NEW[RAKAZO_ADMIN_EMAILS]=$(join "${entries[@]}")
 }
 
+is_entra() { [[ $1 == https://login.microsoftonline.com/* ]]; }
+valid_entra_issuer() { [[ $1 =~ ^https://login\.microsoftonline\.com/[0-9a-fA-F-]{36}/v2\.0$ ]]; }
+
 step_sso() {
   local def=n issuer id secret name
   printf '\n== SSO via OpenID Connect (optional) ==\n'
   NEW[OIDC_ISSUER]="" NEW[OIDC_CLIENT_ID]="" NEW[OIDC_CLIENT_SECRET]="" NEW[OIDC_NAME]=""
+  NEW[OIDC_ALLOW_SIGNUP_BYPASS]=""
   [[ -n ${CUR[OIDC_ISSUER]:-} ]] && def=y
   ask_yn "Set up SSO" "$def" || return 0
   printf 'Redirect URI to register at the provider: https://%s/api/auth/callback/oidc\n' "${NEW[RAKAZO_HOST]}"
+  printf 'The ID token needs the email claim (Entra ID: Token configuration → optional claim email).\n'
   while :; do
     ask issuer "Issuer URL (exactly as in the discovery document)" "${CUR[OIDC_ISSUER]:-}"
-    [[ $issuer =~ ^https://[^/?#@[:space:]]+(/[^?#[:space:]]*)?$ ]] && break
-    warn "The issuer must be an https URL without query or fragment."
+    if [[ ! $issuer =~ ^https://[^/?#@[:space:]]+(/[^?#[:space:]]*)?$ ]]; then
+      warn "The issuer must be an https URL without query or fragment."
+    elif is_entra "$issuer" && ! valid_entra_issuer "$issuer"; then
+      warn "For Entra ID use https://login.microsoftonline.com/<tenant ID>/v2.0 (the GUID, no common)."
+    else
+      break
+    fi
   done
   while :; do ask id "Client ID" "${CUR[OIDC_CLIENT_ID]:-}"; [[ -n $id ]] && break; done
   while :; do ask_secret secret "Client secret" "${CUR[OIDC_CLIENT_SECRET]:-}"; [[ -n $secret ]] && break; done
   ask name "Sign-in button label" "${CUR[OIDC_NAME]:-SSO}"
-  NEW[OIDC_ISSUER]=${issuer%/} NEW[OIDC_CLIENT_ID]=$id NEW[OIDC_CLIENT_SECRET]=$secret NEW[OIDC_NAME]=$name
+  NEW[OIDC_ISSUER]=$issuer NEW[OIDC_CLIENT_ID]=$id NEW[OIDC_CLIENT_SECRET]=$secret NEW[OIDC_NAME]=$name
+
+  printf 'Rakazo trusts the SSO email only with email_verified=true in the ID token. Microsoft Entra ID\n'
+  printf 'never sends it; verified_primary_email and xms_edov are not read.\n'
+  def=y
+  [[ ${CUR[OIDC_ALLOW_SIGNUP_BYPASS]:-} == true ]] || is_entra "$issuer" && def=n
+  if ! ask_yn "Does the provider send email_verified=true" "$def"; then
+    NEW[OIDC_ALLOW_SIGNUP_BYPASS]=true
+    printf 'SSO sign-up then skips the allowlist: everyone the provider lets in can create an account.\n'
+    printf 'Restrict it there (Entra ID: Enterprise application → Properties → Assignment required).\n'
+    printf 'SSO accounts stay unverified: no admin rights and no Link SSO. Admins use --owner.\n'
+  fi
 }
 
 step_catalog() {
@@ -490,6 +518,8 @@ EOF
     env_line OIDC_CLIENT_ID
     env_line OIDC_CLIENT_SECRET
     env_line OIDC_NAME
+    printf '# true for providers without email_verified (Entra ID); SSO sign-up then skips the allowlist.\n'
+    env_line OIDC_ALLOW_SIGNUP_BYPASS
     printf '\n# --- App catalog (optional) -----------------------------------------------------------------------\n'
     printf '# Integrations → Apps: Composio or Pipedream Connect. Without either there is no catalog.\n'
     env_line COMPOSIO_API_KEY
@@ -602,13 +632,21 @@ EOF
   printf '       ./generate-env.sh --owner\n'
   if [[ -n ${NEW[OIDC_ISSUER]} ]]; then
     printf '\nSSO: redirect URI at the provider: https://%s/api/auth/callback/oidc\n' "${NEW[RAKAZO_HOST]}"
-    printf 'The provider must send the email address with email_verified=true. An account from --owner\n'
-    printf 'signs in with its password first and then chooses Link SSO in the account settings; SSO\n'
-    printf 'sign-in with the same address is refused until then.\n'
-    case $SIGNUP_MODE in
-      1) printf 'Signup is closed, so SSO cannot create new accounts.\n' ;;
-      2) printf 'Addresses on the allowlist (%s) can create their account with SSO directly.\n' "${NEW[SIGNUP_ALLOWLIST]}" ;;
-    esac
+    printf 'The ID token needs the email claim (Entra ID: Token configuration → optional claim email).\n'
+    if [[ -n ${NEW[OIDC_ALLOW_SIGNUP_BYPASS]} ]]; then
+      printf 'Without email_verified everyone the provider lets in can sign up with SSO; restrict it there\n'
+      printf '(Entra ID: Enterprise application → Properties → Assignment required = Yes, assign users).\n'
+      printf 'SSO accounts stay unverified: no admin rights from RAKAZO_ADMIN_EMAILS. The --owner account\n'
+      printf 'cannot be linked to SSO and keeps signing in with its password.\n'
+    else
+      printf 'The provider must send email_verified=true. An account from --owner signs in with its\n'
+      printf 'password first and then chooses Link SSO in the account settings; SSO sign-in with the same\n'
+      printf 'address is refused until then.\n'
+      case $SIGNUP_MODE in
+        1) printf 'Signup is closed, so SSO cannot create new accounts.\n' ;;
+        2) printf 'Addresses on the allowlist (%s) can create their account with SSO directly.\n' "${NEW[SIGNUP_ALLOWLIST]}" ;;
+      esac
+    fi
   fi
 }
 
@@ -652,8 +690,12 @@ owner() {
   fi
   [[ ,${admins// /}, == *,"$email",* ]] ||
     printf 'Not in RAKAZO_ADMIN_EMAILS, so no admin rights; add it with ./generate-env.sh if wanted.\n'
-  [[ -z ${CUR[OIDC_ISSUER]:-} ]] ||
+  if [[ ${CUR[OIDC_ALLOW_SIGNUP_BYPASS]:-} == true ]]; then
+    printf 'The SSO provider sends no email_verified, so this account cannot be linked to SSO; it signs\n'
+    printf 'in with its password.\n'
+  elif [[ -n ${CUR[OIDC_ISSUER]:-} ]]; then
     printf 'For SSO: sign in with the password, then choose Link SSO in the account settings.\n'
+  fi
 }
 
 # --- Check ---------------------------------------------------------------------------------------
@@ -767,7 +809,9 @@ check() {
 
   if [[ -n ${CUR[SIGNUP_ALLOWLIST]:-} && ${CUR[SIGNUPS_ENABLED]:-} != false &&
     -z ${CUR[EMAIL_PROVIDER]:-}${CUR[SMTP_URL]:-} ]]; then
-    if [[ -n ${CUR[OIDC_ISSUER]:-} ]]; then
+    if [[ ${CUR[OIDC_ALLOW_SIGNUP_BYPASS]:-} == true ]]; then
+      hint "SSO sign-up skips SIGNUP_ALLOWLIST (OIDC_ALLOW_SIGNUP_BYPASS): restrict users at the provider"
+    elif [[ -n ${CUR[OIDC_ISSUER]:-} ]]; then
       hint "SIGNUP_ALLOWLIST without email delivery: only SSO sign-up works (provider must send email_verified=true)"
     else
       bad "SIGNUP_ALLOWLIST is set but there is no email delivery or SSO: nobody can sign up"
@@ -777,7 +821,21 @@ check() {
     hint "SIGNUP_ALLOWLIST has no effect while SIGNUPS_ENABLED=false; to admit only these addresses set SIGNUPS_ENABLED=true"
   fi
   if [[ ${CUR[SIGNUPS_ENABLED]:-} == false && -n ${CUR[OIDC_ISSUER]:-} ]]; then
-    hint "signup is closed, so SSO cannot create accounts: ./generate-env.sh --owner, then Link SSO in the account settings"
+    if [[ ${CUR[OIDC_ALLOW_SIGNUP_BYPASS]:-} == true ]]; then
+      bad "signup is closed and the SSO provider sends no email_verified: SSO cannot be used (no sign-up, no Link SSO)"
+    else
+      hint "signup is closed, so SSO cannot create accounts: ./generate-env.sh --owner, then Link SSO in the account settings"
+    fi
+  fi
+  case ${CUR[OIDC_ALLOW_SIGNUP_BYPASS]:-} in
+    "" | true | false) ;;
+    *) bad "OIDC_ALLOW_SIGNUP_BYPASS must be true or false (the API does not start otherwise)" ;;
+  esac
+  if is_entra "${CUR[OIDC_ISSUER]:-}"; then
+    valid_entra_issuer "${CUR[OIDC_ISSUER]}" ||
+      bad "OIDC_ISSUER for Entra ID must be https://login.microsoftonline.com/<tenant ID>/v2.0"
+    [[ ${CUR[OIDC_ALLOW_SIGNUP_BYPASS]:-} == true ]] ||
+      bad "Entra ID sends no email_verified: SSO fails with EMAIL_VERIFICATION_REQUIRED; set OIDC_ALLOW_SIGNUP_BYPASS=true (./generate-env.sh)"
   fi
   if [[ -n ${CUR[OIDC_ISSUER]:-}${CUR[OIDC_CLIENT_ID]:-}${CUR[OIDC_CLIENT_SECRET]:-} ]]; then
     [[ -n ${CUR[OIDC_ISSUER]:-} && -n ${CUR[OIDC_CLIENT_ID]:-} && -n ${CUR[OIDC_CLIENT_SECRET]:-} ]] ||
