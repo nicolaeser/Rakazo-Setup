@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
-# Rakazo – sets up and checks the Docker Compose deployment in /opt/rakazo.
+# Rakazo – installs, updates and checks the Docker Compose deployment in /opt/rakazo.
 #
-#   ./generate-env.sh           Create or update the deployment interactively: .env, the Compose
-#                               files, the optional Postfix mail server, /etc/caddy/Caddyfile and
-#                               the DNS records to set. Secrets and custom entries are kept,
+#   wget -q https://raw.githubusercontent.com/nicolaeser/Rakazo-Setup/main/generate-env.sh
+#   bash generate-env.sh        Install or update interactively: downloads docker-compose.yml, the
+#                               Caddyfile template and the Postfix hooks from GitHub, installs
+#                               them and this script in /opt/rakazo, writes .env, the optional
+#                               Postfix mail server, /etc/caddy/Caddyfile and the DNS records, then
+#                               pulls and starts the stack. Secrets and custom entries are kept,
 #                               replaced files are backed up.
-#   ./generate-env.sh --owner   Create the admin account with a password (stack must be running)
-#   ./generate-env.sh --check   Check the deployment, Caddy, mail and DNS; with the stack running
+#   /opt/rakazo/generate-env.sh --owner
+#                               Create the admin account with a password (stack must be running)
+#   /opt/rakazo/generate-env.sh --check
+#                               Check the deployment, Caddy, mail and DNS; with the stack running
 #                               also health, host check, accounts, computers, screen proxy and CORS
-#   ./generate-env.sh --deactivate EMAIL
+#   /opt/rakazo/generate-env.sh --deactivate EMAIL
 #                               Lock an account: ends its sign-ins, computers and runs (edge)
-#   ./generate-env.sh --reactivate EMAIL
+#   /opt/rakazo/generate-env.sh --reactivate EMAIL
 #                               Unlock it again (edge)
 #   --dir DIR                   Deployment directory for all of the above (default /opt/rakazo)
 #
-# Run it from the git checkout. It copies docker-compose.yml (with the mail server also the hooks
-# in postfix/) to the deployment directory and writes .env there. .env holds secrets, domain,
-# ports and options; everything else is fixed in docker-compose.yml and takes precedence there.
+# Every run fetches the current version from GitHub first (RAKAZO_SETUP_URL=URL for another
+# source). .env holds secrets, domain, ports and options; everything else is fixed in
+# docker-compose.yml and takes precedence there.
 # RAKAZO_CADDYFILE=FILE manages another file than /etc/caddy/Caddyfile.
 
 set -euo pipefail
@@ -24,7 +29,14 @@ set -euo pipefail
   { echo "Error: Bash 4.4 or newer required." >&2; exit 1; }
 shopt -u patsub_replacement 2>/dev/null || true
 
-REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+ARGS=("$@")
+# Where the script was started from; set when it restarts as the downloaded version.
+SCRIPT_DIR=${RAKAZO_SETUP_FROM:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)}
+SETUP_URL=${RAKAZO_SETUP_URL:-https://raw.githubusercontent.com/nicolaeser/Rakazo-Setup/main}
+SETUP_FILES=(generate-env.sh docker-compose.yml Caddyfile.example postfix/rakazo.sh postfix/rakazo-inbound-email)
+SRC=${RAKAZO_SETUP_SRC:-}  # temporary folder with the downloaded setup files
+[[ $SRC == */rakazo-setup.* && -f $SRC/generate-env.sh ]] || SRC=""
+LEGACY_DIR=""      # folder of an install from before /opt/rakazo
 DEPLOY_DIR=/opt/rakazo
 DIR_OPT=""         # " --dir DIR" for printed commands when DEPLOY_DIR is not the default
 CADDY_FILE=${RAKAZO_CADDYFILE:-/etc/caddy/Caddyfile}
@@ -78,6 +90,7 @@ CADDY_TODO=()      # commands left to the user when the Caddy file was not writt
 CADDY_ROW=""       # Caddy line of the summary
 RUN=()             # sudo when the current target needs it (see root_for)
 PORTS_CHANGED=0
+STARTED=0          # the stack was started by this run
 MODELS=""          # model IDs from the last fetch_models
 MAIL_MODE=""       # receive, send, receive+send or empty
 OLD_MAIL=""        # the same for the existing deployment
@@ -269,14 +282,25 @@ enter_deploy_dir() {
 use_deploy_dir() {
   if [[ ! -f $DEPLOY_DIR/$ENV_FILE ]]; then
     legacy_install &&
-      die "This install still runs from the checkout. Run $SELF to move it to $DEPLOY_DIR, or add --dir $REPO_DIR."
-    die "No .env in $DEPLOY_DIR. Run $SELF first."
+      die "This install still runs from $LEGACY_DIR. Run generate-env.sh to move it to $DEPLOY_DIR, or add --dir $LEGACY_DIR."
+    die "No .env in $DEPLOY_DIR. Install first: bash generate-env.sh"
   fi
   cd "$DEPLOY_DIR"
 }
 
-# The layout before /opt/rakazo: .env and data/ next to the script.
-legacy_install() { [[ ! $REPO_DIR -ef $DEPLOY_DIR && (-f $REPO_DIR/$ENV_FILE || -d $REPO_DIR/data) ]]; }
+# The layout before /opt/rakazo: a checkout with docker-compose.yml, .env and data/. Found where the
+# script runs or where Docker started the containers of project rakazo; sets LEGACY_DIR.
+legacy_install() {
+  local d
+  for d in "$SCRIPT_DIR" "$(docker ps -a --filter label=com.docker.compose.project=rakazo \
+    --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | head -n 1)"; do
+    if [[ -n $d && ! $d -ef $DEPLOY_DIR && -f $d/docker-compose.yml && (-f $d/$ENV_FILE || -d $d/data) ]]; then
+      LEGACY_DIR=$d
+      return 0
+    fi
+  done
+  return 1
+}
 
 # listing DIR ITEM… – path, type, size, owner and mode of everything below ITEM, sorted
 listing() {
@@ -291,52 +315,52 @@ listing() {
 migrate_legacy() {
   local items=() i same=1 before after keep="" moved=()
   if [[ -f $DEPLOY_DIR/$ENV_FILE ]]; then
-    warn "$REPO_DIR still holds .env or data/ of the old layout; $DEPLOY_DIR is used."
+    warn "$LEGACY_DIR still holds .env or data/ of the old layout; $DEPLOY_DIR is used."
     enter_deploy_dir
     return 0
   fi
-  for i in "$REPO_DIR/$ENV_FILE" "$REPO_DIR/$ENV_FILE".bak.* "$REPO_DIR/data" "$REPO_DIR/credentials"; do
+  for i in "$LEGACY_DIR/$ENV_FILE" "$LEGACY_DIR/$ENV_FILE".bak.* "$LEGACY_DIR/data" "$LEGACY_DIR/credentials"; do
     if [[ -e $i ]]; then items+=("${i##*/}"); fi
   done
   section "Move the install to $DEPLOY_DIR"
-  printf 'Rakazo now runs from %s instead of the checkout. Found in %s:\n' "$DEPLOY_DIR" "$REPO_DIR"
+  printf 'Rakazo now runs from %s instead of the old folder. Found in %s:\n' "$DEPLOY_DIR" "$LEGACY_DIR"
   printf '  %s\n' "${items[*]}"
   printf 'Moving them:\n'
-  printf '  1. stops the stack: docker compose down in the checkout (data stays, computers keep running)\n'
+  printf '  1. stops the stack: docker compose down in the old folder (data stays, computers keep running)\n'
   printf '  2. moves them to %s with owners and modes (postgres and app data belong to the\n' "$DEPLOY_DIR"
   printf '     container users, so this uses sudo)\n'
   printf '  3. compares owners, modes and sizes on both sides\n'
   if ! ask_yn "Move the install now" y; then
-    printf 'Nothing changed. To keep running from the checkout: %s/generate-env.sh --dir %s\n' "$REPO_DIR" "$REPO_DIR"
+    printf 'Nothing changed. To keep running from there: bash generate-env.sh --dir %s\n' "$LEGACY_DIR"
     exit 0
   fi
   enter_deploy_dir
   for i in "${items[@]}"; do
     [[ ! -e $i ]] || die "$DEPLOY_DIR/$i already exists. Move it away first; nothing was changed."
-    [[ $(stat -c %d "$REPO_DIR/$i") == $(stat -c %d .) ]] || same=0
+    [[ $(stat -c %d "$LEGACY_DIR/$i") == $(stat -c %d .) ]] || same=0
   done
   RUN=()
   if ((EUID != 0)) && ! ask_yn "Use sudo for the move" y; then
-    printf 'Nothing changed. By hand:\n  cd %s && docker compose down\n' "$REPO_DIR"
+    printf 'Nothing changed. By hand:\n  cd %s && docker compose down\n' "$LEGACY_DIR"
     if ((same)); then
-      printf '  cd %s && sudo mv %s %s/\n' "$REPO_DIR" "${items[*]}" "$DEPLOY_DIR"
+      printf '  cd %s && sudo mv %s %s/\n' "$LEGACY_DIR" "${items[*]}" "$DEPLOY_DIR"
     else
-      printf '  cd %s && sudo cp -a %s %s/\n' "$REPO_DIR" "${items[*]}" "$DEPLOY_DIR"
-      printf '  then move the originals out of the checkout once Rakazo runs from %s\n' "$DEPLOY_DIR"
+      printf '  cd %s && sudo cp -a %s %s/\n' "$LEGACY_DIR" "${items[*]}" "$DEPLOY_DIR"
+      printf '  then move the originals out of the old folder once Rakazo runs from %s\n' "$DEPLOY_DIR"
     fi
-    printf 'and run %s again.\n' "$SELF"
+    printf 'and run generate-env.sh again.\n'
     exit 1
   fi
   ((EUID == 0)) || RUN=(sudo)
-  (cd "$REPO_DIR" && docker compose down) || die "Could not stop the stack in $REPO_DIR; nothing was moved."
-  before=$(listing "$REPO_DIR" "${items[@]}") || die "Could not list ${items[*]} in $REPO_DIR; nothing was moved."
+  (cd "$LEGACY_DIR" && docker compose down) || die "Could not stop the stack in $LEGACY_DIR; nothing was moved."
+  before=$(listing "$LEGACY_DIR" "${items[@]}") || die "Could not list ${items[*]} in $LEGACY_DIR; nothing was moved."
   for i in "${items[@]}"; do
     if ((same)); then
-      "${RUN[@]}" mv -- "$REPO_DIR/$i" "$i" ||
-        die "Moving $i failed. Already in $DEPLOY_DIR: ${moved[*]:-nothing}; the rest is still in $REPO_DIR."
+      "${RUN[@]}" mv -- "$LEGACY_DIR/$i" "$i" ||
+        die "Moving $i failed. Already in $DEPLOY_DIR: ${moved[*]:-nothing}; the rest is still in $LEGACY_DIR."
     else
-      "${RUN[@]}" cp -a -- "$REPO_DIR/$i" "$i" ||
-        die "Copying $i failed. The originals in $REPO_DIR are unchanged; remove the partial copies in $DEPLOY_DIR."
+      "${RUN[@]}" cp -a -- "$LEGACY_DIR/$i" "$i" ||
+        die "Copying $i failed. The originals in $LEGACY_DIR are unchanged; remove the partial copies in $DEPLOY_DIR."
     fi
     moved+=("$i")
   done
@@ -344,37 +368,68 @@ migrate_legacy() {
   if [[ $before != "$after" ]]; then
     diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -20 >&2 || true
     if ((same)); then die "After the move the files differ from before (see above). Check $DEPLOY_DIR."; fi
-    die "The copies differ from the originals (see above). The originals in $REPO_DIR are unchanged."
+    die "The copies differ from the originals (see above). The originals in $LEGACY_DIR are unchanged."
   fi
   if ((!same)); then
     keep=migrated-$STAMP
-    mkdir "$REPO_DIR/$keep"
-    for i in "${items[@]}"; do "${RUN[@]}" mv -- "$REPO_DIR/$i" "$REPO_DIR/$keep/"; done
+    mkdir "$LEGACY_DIR/$keep"
+    for i in "${items[@]}"; do "${RUN[@]}" mv -- "$LEGACY_DIR/$i" "$LEGACY_DIR/$keep/"; done
   fi
-  DONE+=("Moved ${items[*]} from $REPO_DIR (same files, owners, modes and sizes)")
-  [[ -z $keep ]] || DONE+=("Originals kept in $REPO_DIR/$keep; delete them once Rakazo runs from $DEPLOY_DIR")
+  DONE+=("Moved ${items[*]} from $LEGACY_DIR (same files, owners, modes and sizes)")
+  [[ -z $keep ]] || DONE+=("Originals kept in $LEGACY_DIR/$keep; delete them once Rakazo runs from $DEPLOY_DIR")
   deploy_file docker-compose.yml
   printf 'Moved and checked. The stack is stopped; to start it from the new place right away:\n'
   printf '  cd %s && docker compose up -d\n' "$DEPLOY_DIR"
   printf 'The settings below start from the moved .env and also update Caddy and the DNS list.\n'
 }
 
-# deploy_file PATH – copies PATH from the checkout; a copy that differs is backed up first. Sets
-# COPIED to 0 (unchanged), 1 (new) or 2 (replaced).
+# --- Setup files ---------------------------------------------------------------------------------
+
+# Downloads SETUP_FILES from SETUP_URL into a new temporary folder SRC.
+download() {
+  local f
+  command -v wget >/dev/null || { warn "wget is missing: sudo apt install wget"; return 1; }
+  SRC=$(mktemp -d -t rakazo-setup.XXXXXX)
+  mkdir "$SRC/postfix"
+  for f in "${SETUP_FILES[@]}"; do
+    if ! wget -q -T 30 -O "$SRC/$f" "$SETUP_URL/$f"; then
+      warn "Could not download $SETUP_URL/$f"
+      rm -rf "$SRC"
+      SRC=""
+      return 1
+    fi
+  done
+}
+
+# Fetches the setup files; a script that differs from the downloaded one restarts as that one, so
+# that script and files are always the same version.
+fetch_setup() {
+  if [[ -z $SRC ]]; then
+    download || exit 1
+    if [[ ! -f ${BASH_SOURCE[0]} ]] || ! cmp -s "$SRC/generate-env.sh" "${BASH_SOURCE[0]}"; then
+      printf 'Starting the current version from %s.\n' "$SETUP_URL"
+      exec env RAKAZO_SETUP_SRC="$SRC" RAKAZO_SETUP_FROM="$SCRIPT_DIR" bash "$SRC/generate-env.sh" "${ARGS[@]}"
+    fi
+  fi
+  trap 'rm -rf "$SRC"' EXIT
+}
+
+# deploy_file PATH – installs PATH from SRC; a copy that differs is backed up first. Sets COPIED to
+# 0 (unchanged), 1 (new) or 2 (replaced).
 deploy_file() {
   local f=$1
   COPIED=0
-  if cmp -s "$REPO_DIR/$f" "$f"; then return 0; fi
+  if cmp -s "$SRC/$f" "$f"; then return 0; fi
   COPIED=1
   if [[ -f $f ]]; then cp -p "$f" "$f.bak.$STAMP"; COPIED=2; fi
   mkdir -p "$(dirname "$f")"
-  cp "$REPO_DIR/$f" "$f.tmp.$$"
+  cp "$SRC/$f" "$f.tmp.$$"
+  if [[ $f == docker-compose.yml ]]; then chmod 644 "$f.tmp.$$"; else chmod 755 "$f.tmp.$$"; fi
   mv -f "$f.tmp.$$" "$f"
 }
 
 deploy_files() {
   local f files=(docker-compose.yml) copied=() kept=""
-  [[ $REPO_DIR -ef . ]] && return 0
   [[ -z $MAIL_MODE ]] || files+=(postfix/rakazo.sh postfix/rakazo-inbound-email)
   for f in "${files[@]}"; do
     deploy_file "$f"
@@ -382,7 +437,13 @@ deploy_files() {
     ((COPIED == 1)) || kept=", previous versions kept as *.bak.$STAMP"
     copied+=("$f")
   done
-  ((${#copied[@]} == 0)) || DONE+=("Copied from the checkout: $(join "${copied[@]}" | sed 's/,/, /g')$kept")
+  if ! cmp -s "$SRC/generate-env.sh" generate-env.sh; then
+    cp "$SRC/generate-env.sh" "generate-env.sh.tmp.$$"
+    chmod 755 "generate-env.sh.tmp.$$"
+    mv -f "generate-env.sh.tmp.$$" generate-env.sh
+    copied+=(generate-env.sh)
+  fi
+  ((${#copied[@]} == 0)) || DONE+=("Installed from GitHub: $(join "${copied[@]}" | sed 's/,/, /g')$kept")
 }
 
 # A run as root leaves the files to the user the deployment directory belongs to.
@@ -390,7 +451,7 @@ hand_over() {
   local f group
   ((EUID == 0)) && [[ $OWNER_USER != root ]] || return 0
   group=$(id -gn "$OWNER_USER")
-  for f in "$ENV_FILE" "$ENV_FILE".bak.* docker-compose* dns-records.txt ./*.new data credentials; do
+  for f in "$ENV_FILE" "$ENV_FILE".bak.* docker-compose* generate-env.sh dns-records.txt ./*.new data credentials; do
     if [[ -e $f ]]; then chown "$OWNER_USER:$group" "$f"; fi
   done
   if [[ -d postfix ]]; then chown -R "$OWNER_USER:$group" postfix; fi
@@ -1090,7 +1151,7 @@ write_env() {
   tmp=$(mktemp "$ENV_FILE.XXXXXX")
   {
     printf '# Rakazo – written by generate-env.sh on %s. Contains secrets: do not commit or share.\n' "$(date '+%Y-%m-%d %H:%M')"
-    printf '# To change: run %s/generate-env.sh again. Then here: docker compose up -d\n' "$REPO_DIR"
+    printf '# To change: run %s again. Then here: docker compose up -d\n' "$SELF"
     cat <<'EOF'
 
 # --- Access ---------------------------------------------------------------------------------------
@@ -1287,7 +1348,7 @@ render_caddy() {
   local -n rc=$1
   local t up
   up=$(upstream_ip "${rc[RAKAZO_BIND]:-127.0.0.1}")
-  t=$(<"$REPO_DIR/Caddyfile.example")
+  t=$(<"$SRC/Caddyfile.example")
   t=${t//127.0.0.1:$DEFAULT_WEB_PORT /@WEB@ } t=${t//127.0.0.1:$DEFAULT_API_PORT /@API@ }
   t=${t//@WEB@/$up:${rc[RAKAZO_WEB_PORT]:-}} t=${t//@API@/$up:${rc[RAKAZO_API_PORT]:-}}
   printf '%s\n' "${t//rakazo.example.com/${rc[RAKAZO_HOST]:-}}"
@@ -1483,6 +1544,22 @@ dns_text() {
   [[ $m != *send ]] || printf 'Sending needs outbound 25/tcp, which many hosters block until you ask.\n'
 }
 
+# Pulls the images and starts or updates the stack, if wanted.
+start_stack() {
+  section "Start Rakazo"
+  if ! command -v docker >/dev/null; then
+    printf 'Docker is not installed (https://docs.docker.com/engine/install/).\n'
+    return 0
+  fi
+  ask_yn "Pull the images and start now (docker compose pull && docker compose up -d)" y || return 0
+  if docker compose pull && docker compose up -d; then
+    STARTED=1
+    DONE+=("Images pulled, stack started")
+  else
+    warn "The start failed (see above). After fixing it: cd $DEPLOY_DIR && docker compose up -d"
+  fi
+}
+
 # --- Result --------------------------------------------------------------------------------------
 
 section() { printf '\n== %s ==\n' "$1"; }
@@ -1513,7 +1590,7 @@ summary() {
   row "App catalog" "$(case $CATALOG_MODE in 1) echo none ;; 2) echo Composio ;; 3) echo "Pipedream (${NEW[PIPEDREAM_ENVIRONMENT]})" ;; esac)"
   [[ -z $CADDY_ROW ]] || row Caddy "$CADDY_ROW"
 
-  if [[ -n ${CUR[RAKAZO_IMAGE_TAG]:-} && ${CUR[RAKAZO_IMAGE_TAG]} != "${NEW[RAKAZO_IMAGE_TAG]}" ]]; then
+  if ((!STARTED)) && [[ -n ${CUR[RAKAZO_IMAGE_TAG]:-} && ${CUR[RAKAZO_IMAGE_TAG]} != "${NEW[RAKAZO_IMAGE_TAG]}" ]]; then
     notes+=("Images change to ${NEW[RAKAZO_IMAGE_TAG]}: in $DEPLOY_DIR docker compose pull && docker compose up -d")
   fi
   if ((PORTS_CHANGED)) && { remote_proxy NEW || ((${#CADDY_TODO[@]})); }; then
@@ -1596,8 +1673,12 @@ EOF
      If the stack already runs: cd $DEPLOY_DIR && docker compose up -d --force-recreate supervisor
 EOF
 
-  section Start
-  step "cd $DEPLOY_DIR && docker compose up -d"
+  if ((STARTED)); then
+    section "After the start"
+  else
+    section Start
+    step "cd $DEPLOY_DIR && docker compose pull && docker compose up -d"
+  fi
   step "$SELF --check"
   if ((SIGNUP_MODE == 1)) && [[ -z $scim ]]; then
     step "$SELF --owner   the admin account with a password, the only way in while signup is closed"
@@ -1637,9 +1718,7 @@ EOF
   fi
 
   section Later
-  row Update "git pull in $REPO_DIR, then $SELF"
-  row "" "and in $DEPLOY_DIR: docker compose pull && docker compose up -d"
-  row "Change settings" "$SELF, then in $DEPLOY_DIR: docker compose up -d"
+  row "Update, settings" "$SELF   (current files from GitHub, then pull and start)"
   row Check "$SELF --check"
   if on_edge; then
     row "Lock someone out" "$SELF --deactivate EMAIL (undo with --reactivate)"
@@ -1649,6 +1728,7 @@ EOF
 generate() {
   command -v openssl >/dev/null || die "openssl is missing."
   [[ -t 0 ]] || die "Please run interactively in a terminal."
+  fetch_setup
   printf 'Rakazo – set up the deployment in %s\n' "$DEPLOY_DIR"
   if legacy_install; then migrate_legacy; else enter_deploy_dir; fi
   load_env
@@ -1689,6 +1769,7 @@ Restore the old .env from its backup or delete data/ deliberately."
     >dns-records.txt
   DONE+=("dns-records.txt written")
   hand_over
+  start_stack
 
   summary
   section "DNS records"
@@ -1867,26 +1948,30 @@ check_screen() { # check_screen BASE_URL label [curl options …]
 SMTP_VERIFY_JS='const u=new URL(process.env.SMTP_URL);if(u.protocol==="smtp:")u.searchParams.set("requireTLS","true");for(const [k,v] of [["connectionTimeout",1e4],["greetingTimeout",1e4],["socketTimeout",3e4]])if(!u.searchParams.has(k))u.searchParams.set(k,String(v));require(require.resolve("nodemailer",{paths:["/app/packages/adapters"]})).createTransport(u.href).verify().then(()=>process.exit(0),e=>{console.error([e.code,e.responseCode,e.message].filter(Boolean).join(" ").replace(/\/\/[^@\s]*@/g,"//***@"));process.exit(1)})'
 
 check_deploy() {
-  local f owner files=(docker-compose.yml) differ=()
+  local f owner files=(generate-env.sh docker-compose.yml) differ=()
   printf 'Deployment (%s)\n' "$DEPLOY_DIR"
   owner=$(stat -c %U .)
   if [[ $owner == "$(id -un)" ]]; then ok "owned by $owner"
   else hint "owned by $owner, not $(id -un): the script and docker compose need sudo there"; fi
   [[ $(stat -c %a .) != *[2367] ]] || bad "$DEPLOY_DIR is writable for everyone: chmod o-w $DEPLOY_DIR"
   [[ -d data && -d credentials ]] || hint "data/ or credentials/ is missing: docker compose creates it owned by root"
-  [[ ! $REPO_DIR -ef . ]] || return 0
   [[ -z $OLD_MAIL ]] || files+=(postfix/rakazo.sh postfix/rakazo-inbound-email)
-  for f in "${files[@]}"; do
-    if [[ ! -f $f ]]; then bad "$f is missing: $SELF copies it"
-    elif ! cmp -s "$REPO_DIR/$f" "$f"; then differ+=("$f"); fi
-  done
-  if ((${#differ[@]})); then
-    hint "differs from the checkout: ${differ[*]}; $SELF copies the new version (a changed copy is backed up)"
+  if [[ -z $SRC ]]; then
+    hint "files not compared with $SETUP_URL (download failed)"
   else
-    ok "${files[*]} match the checkout"
+    for f in "${files[@]}"; do
+      if [[ ! -f $f ]]; then bad "$f is missing: $SELF installs it"
+      elif ! cmp -s "$SRC/$f" "$f"; then differ+=("$f"); fi
+    done
+    if ((${#differ[@]})); then
+      hint "not the version on GitHub: ${differ[*]}; $SELF installs it (a changed docker-compose.yml is backed up)"
+    else
+      ok "${files[*]} are the version on GitHub"
+    fi
   fi
-  [[ ! -f $REPO_DIR/$ENV_FILE ]] || hint "$REPO_DIR/.env is left from the old layout and unused"
-  for f in "$REPO_DIR"/migrated-*; do
+  legacy_install || return 0
+  [[ ! -f $LEGACY_DIR/$ENV_FILE ]] || hint "$LEGACY_DIR/.env is left from the old layout and unused"
+  for f in "$LEGACY_DIR"/migrated-*; do
     if [[ -d $f ]]; then hint "$f holds the files of the old layout: delete it once this install works"; fi
   done
 }
@@ -1901,7 +1986,8 @@ check_caddy() {
     hint "$f not found or not readable: $SELF writes it"
     return 0
   fi
-  if [[ $(<"$f") == "$(render_caddy CUR)" ]]; then ok "$f is what $SELF writes"
+  if [[ -z $SRC ]]; then :
+  elif [[ $(<"$f") == "$(render_caddy CUR)" ]]; then ok "$f is what $SELF writes"
   else hint "$f differs from what $SELF writes (template, .env or changes here): it shows the diff"; fi
   if ! grep -qF "$host {" "$f"; then
     bad "$f has no site block for $host: $SELF writes it, then reload Caddy"
@@ -2057,6 +2143,7 @@ check() {
   [[ -f $ENV_FILE ]] || die "No .env found. Run $SELF first."
   load_env
   load_postfix_env
+  if download; then trap 'rm -rf "$SRC"' EXIT; fi
   host=${CUR[RAKAZO_HOST]:-}
   origin=https://$host
   up=$(upstream_ip "${CUR[RAKAZO_BIND]:-127.0.0.1}")
@@ -2366,7 +2453,7 @@ check() {
   printf 'All good.\n'
 }
 
-usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^$/s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; }
 
 ACTION="" ACCOUNT=""
 while (($#)); do
@@ -2383,7 +2470,7 @@ done
 DEPLOY_DIR=$(realpath -m -- "$DEPLOY_DIR")
 [[ $DEPLOY_DIR == /opt/rakazo ]] || DIR_OPT=" --dir $DEPLOY_DIR"
 # How to call this script again, as printed in hints and next steps.
-SELF=${REPO_DIR/#"${HOME:-/nonexistent}"/\~}/generate-env.sh$DIR_OPT
+SELF=$DEPLOY_DIR/generate-env.sh$DIR_OPT
 
 case $ACTION in
   "") generate ;;
